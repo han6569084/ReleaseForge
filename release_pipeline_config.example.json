@@ -48,7 +48,6 @@
   },
   "prepare": {
     "mode": "placeholders_dsl",
-    "placeholders_config": "pamir_64m.placeholders.json",
     "workspace_dir": "work/prepare",
     "clean": true,
     "notes": "Release: 按规则解压提取 watch@mhs003.elf + watch@mhs003_ota_sign.zip，生成 staging 目录后再上传。"

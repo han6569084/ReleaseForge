@@ -16,6 +16,15 @@
 
       "steps": [
         {
+          "op": "download_jenkins_console",
+          "name": "download release console log",
+          "run": "release",
+          "build_url": "${jenkins.builds.release.build_url}",
+          "to": "${prepare.flow.upload_payload_dir}/jenkins_release_console.log",
+          "save_as": "release_console_log_payload",
+          "optional": true
+        },
+        {
           "op": "find",
           "name": "find release top tgz",
           "root": "${jenkins.builds.release.download.output_dir}",
@@ -308,7 +317,12 @@
         "match": { "regex": ".*md5.*\\.txt$|md5\\.txt$|_md5\\.txt$|md5sum\\.txt$" }
       },
 
-      "{{REL_BUILD_LOG_FILE}}": { "mode": "const", "value": "" }
+      "{{REL_BUILD_LOG_FILE}}": {
+        "mode": "nas_share",
+        "run": "release",
+        "from": "release_console_log_payload",
+        "required": false
+      }
     }
   }
 }

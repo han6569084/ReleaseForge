@@ -153,6 +153,11 @@ venv.bak/
 
 # mkdocs documentation
 /site
+# Local config files that may contain credentials (keep *.example.json)
+release_pipeline_config*.json
+!release_pipeline_config.example.json
+nas_upload_config.json
+nas_upload_config.json.tmp
 
 # mypy
 .mypy_cache/

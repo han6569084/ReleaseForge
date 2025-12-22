@@ -123,7 +123,8 @@
             "extract_tgz",
             "extract_tar",
             "extract_if_single_tar",
-            "copy_to_payload"
+            "copy_to_payload",
+            "download_jenkins_console"
           ]
         },
         "name": {
@@ -148,6 +149,11 @@
         "to": {
           "type": "string",
           "description": "Output directory (for extract) or output file template (for copy_to_payload). Can contain ${...} placeholders and ${basename}/${filename}."
+        },
+
+        "build_url": {
+          "type": "string",
+          "description": "Jenkins build_url used to download consoleText (can contain ${...} placeholders). If omitted, executor may use jenkins.builds.<run>.build_url from main config."
         },
 
         "match": {
@@ -210,6 +216,10 @@
         {
           "if": { "properties": { "op": { "const": "copy_to_payload" } } },
           "then": { "required": ["from"] }
+        },
+        {
+          "if": { "properties": { "op": { "const": "download_jenkins_console" } } },
+          "then": { "required": ["to", "save_as"] }
         }
       ]
     },

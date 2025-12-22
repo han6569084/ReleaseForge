@@ -1317,6 +1317,46 @@ def _dsl_execute_prepare_flow(
                 if also:
                     vars[also] = dest
 
+            elif op == "download_jenkins_console":
+                build_url = str(step.get("build_url") or "").strip()
+                if not build_url:
+                    # Fallback: use cfg jenkins.builds.<run>.build_url
+                    try:
+                        build_url = str(_get_by_dotted_path(cfg, f"jenkins.builds.{current_run}.build_url"))
+                    except Exception:
+                        build_url = ""
+                if not build_url:
+                    raise RuntimeError(f"DSL: {name} missing build_url")
+
+                to_raw = step.get("to")
+                if isinstance(to_raw, str) and str(to_raw).strip():
+                    dest = _dsl_resolve_ref_or_path(to_raw, vars=vars, what=f"{name}.to")
+                else:
+                    dest = upload_payload_dir / f"jenkins_{current_run}_console.log"
+
+                # Jenkins auth from main cfg
+                j_auth = (cfg.get("jenkins") or {}).get("auth") or {}
+                if not isinstance(j_auth, dict):
+                    j_auth = {}
+                j_user = str(j_auth.get("username") or "").strip()
+                j_pass = str(j_auth.get("password") or "").strip()
+                if not j_user or not j_pass:
+                    raise RuntimeError("DSL: Jenkins auth missing (jenkins.auth.username/password)")
+
+                timeout_sec = int((cfg.get("jenkins") or {}).get("timeout_sec", 600))
+                _jenkins_download_console_text(
+                    build_url=build_url,
+                    auth=JenkinsAuth(username=j_user, password=j_pass),
+                    dest=dest,
+                    timeout_sec=timeout_sec,
+                    dry_run=dry_run,
+                    show_progress=False,
+                )
+
+                save_as = str(step.get("save_as") or "").strip()
+                if save_as:
+                    vars[save_as] = dest
+
             else:
                 raise RuntimeError(f"DSL: unsupported op={op!r} ({name})")
 
@@ -2227,6 +2267,39 @@ def _curl_download_file(
         raise RuntimeError(f"download failed rc={proc.returncode} url={url} dest={dest}")
 
 
+def _jenkins_console_text_url(build_url: str) -> str:
+    b = str(build_url or "").strip()
+    if not b:
+        raise RuntimeError("Jenkins build_url is empty")
+    return b.rstrip("/") + "/consoleText"
+
+
+def _jenkins_download_console_text(
+    *,
+    build_url: str,
+    auth: JenkinsAuth,
+    dest: Path,
+    timeout_sec: int,
+    dry_run: bool,
+    show_progress: bool,
+) -> None:
+    url = _jenkins_console_text_url(build_url)
+    if dry_run:
+        print(f"Jenkins: dry-run; would download console log: {url} -> {dest}")
+        return
+    # Jenkins is public TLS; keep verify on.
+    with CurlNetrc(build_url.rstrip("/") + "/", auth.username, auth.password) as netrc:
+        assert netrc.path
+        _curl_download_file(
+            url=url,
+            netrc_path=netrc.path,
+            verify_tls=True,
+            timeout_sec=timeout_sec,
+            dest=dest,
+            show_progress=show_progress,
+        )
+
+
 def jenkins_download_artifacts(
     *,
     build_url: str,
@@ -2485,18 +2558,39 @@ def main() -> int:
     dsl_cfg: Optional[Dict[str, Any]] = None
     dsl_runtime: Optional[Dict[str, Any]] = None
     if prepare_mode.strip().lower() in ("placeholders_dsl", "dsl"):
-        dsl_path_value = (
-            prepare_cfg.get("placeholders_config")
-            or prepare_cfg.get("flow_config")
-            or prepare_cfg.get("placeholders_flow_config")
-            or prepare_cfg.get("placeholders_config_path")
-        )
-        if not dsl_path_value:
+        def _auto_pick_dsl_path() -> Path:
+            dsl_path_value = (
+                prepare_cfg.get("placeholders_config")
+                or prepare_cfg.get("flow_config")
+                or prepare_cfg.get("placeholders_flow_config")
+                or prepare_cfg.get("placeholders_config_path")
+            )
+            if dsl_path_value:
+                p = _resolve_cfg_path(dsl_path_value)
+                if not p.exists():
+                    raise SystemExit(f"DSL config not found: {p}")
+                return p
+
+            # Default placeholders config (shared across projects).
+            candidates: List[Path] = [(cfg_base_dir / "placeholders.default.json").resolve()]
+
+            for c in candidates:
+                if c.exists():
+                    return c
+
+            # Backward-compat: if there's exactly one *.placeholders.json in config dir, use it.
+            globbed = sorted(cfg_base_dir.glob("*.placeholders.json"))
+            if len(globbed) == 1 and globbed[0].exists():
+                print(f"DSL Prepare: auto-picked placeholders config: {globbed[0]}")
+                return globbed[0].resolve()
+
+            cand_msg = "\n".join([f"  - {c}" for c in candidates])
             raise SystemExit(
-                "prepare.mode=placeholders_dsl requires prepare.placeholders_config (path to *.placeholders.json)"
+                "prepare.mode=placeholders_dsl requires a placeholders DSL config. "
+                "Either set prepare.placeholders_config explicitly, or create the default file:\n" + cand_msg
             )
 
-        dsl_path = _resolve_cfg_path(dsl_path_value)
+        dsl_path = _auto_pick_dsl_path()
         dsl_raw = json.loads(dsl_path.read_text(encoding="utf-8"))
         if not isinstance(dsl_raw, dict):
             raise SystemExit(f"Invalid DSL json (expected object): {dsl_path}")
