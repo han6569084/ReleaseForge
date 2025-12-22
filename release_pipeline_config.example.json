@@ -1,0 +1,147 @@
+{
+  "release": {
+    "project": "pamir_64m",
+    "device_name": "pamir_64m",
+    "stage": "beta4",
+    "version": "3.6.0.3",
+    "variant": "pamir_64m beta4 v3.6.0.3",
+    "notes": ""
+  },
+  "jenkins": {
+    "base_url": "https://jenkins.huami.com",
+    "timeout_sec": 600,
+    "auth": {
+      "type": "basic",
+      "username": "hanzhijian",
+      "password": "Asdfghjkl;'@6902"
+    },
+    "builds": {
+      "debug": {
+        "build_url": "https://jenkins.huami.com/job/firmware_auto_trigger/job/HuamiOS_HS3/4015/",
+        "download": {
+          "mode": "artifacts",
+          "include_globs": [
+            "**/*"
+          ],
+          "exclude_globs": [
+            "**/*.log"
+          ],
+          "output_dir": "work/download/debug",
+          "overwrite": true
+        }
+      },
+      "release": {
+        "build_url": "https://jenkins.huami.com/job/firmware_auto_trigger/job/HuamiOS_HS3/4014/",
+        "download": {
+          "mode": "artifacts",
+          "include_globs": [
+            "**/*"
+          ],
+          "exclude_globs": [
+            "**/*.log"
+          ],
+          "output_dir": "work/download/release",
+          "overwrite": true
+        }
+      }
+    }
+  },
+  "prepare": {
+    "mode": "release_extract",
+    "workspace_dir": "work/prepare",
+    "clean": true,
+    "notes": "Release: 按规则解压提取 watch@mhs003.elf + watch@mhs003_ota_sign.zip，生成 staging 目录后再上传。"
+  },
+  "nas": {
+    "webdav": {
+      "base_url": "https://10.2.100.85:5006",
+      "verify_tls": false,
+      "timeout_sec": 1800,
+      "auth": {
+        "username": "hanzhijian",
+        "password": "Huami2025"
+      }
+    },
+    "dsm": {
+      "base_url": "https://10.2.100.85:5001",
+      "verify_tls": false,
+      "auth": {
+        "username": "hanzhijian",
+        "password": "Huami2025"
+      }
+    },
+    "remote": {
+      "base_dir": "/GT智能手表事业部/软件部/软件版本文档/hzj-test/Cologne",
+      "folder_name": "${release.variant}",
+      "path_strategy": "base_plus_folder"
+    },
+    "uploads": [
+      {
+        "name": "debug",
+        "remote_subdir": "Monkey",
+        "local_dir": "${jenkins.builds.debug.download.output_dir}",
+        "include_globs": [
+          "**/*"
+        ],
+        "exclude_globs": [],
+        "overwrite": true
+      },
+      {
+        "name": "release",
+        "remote_subdir": "Release",
+        "local_dir": "${jenkins.builds.release.download.output_dir}",
+        "extra_local_dirs": [
+          "${prepare.workspace_dir}/release_extract/upload_payload"
+        ],
+        "include_globs": [
+          "**/*"
+        ],
+        "exclude_globs": [],
+        "overwrite": true
+      }
+    ]
+  },
+  "doc": {
+    "enabled": true,
+    "output_dir": "",
+    "filename_template": "{project}_{version}_{timestamp}_版本文档.md"
+  },
+  "feishu": {
+    "enabled": true,
+    "use_wiki": true,
+    "wiki_copy_only": false,
+    "docx_replace_placeholders": true,
+    "docx_replace_only": true,
+    "print_placeholder_mapping": true,
+    "user_access_token": "eyJhbGciOiJFUzI1NiIsImZlYXR1cmVfY29kZSI6IkZlYXR1cmVPQXV0aEpXVFNpZ25fQ04iLCJraWQiOiI3NTg0OTgxMzk1MTY0ODkyOTkxIiwidHlwIjoiSldUIn0.eyJqdGkiOiI3NTg2MjMzNDczMzA4ODM4ODU0IiwiaWF0IjoxNzY2MzA3NjIyLCJleHAiOjE3NjYzMTQ4MjIsInZlciI6InYxIiwidHlwIjoiYWNjZXNzX3Rva2VuIiwiY2xpZW50X2lkIjoiY2xpX2E2YjIxODA0YjUyYjUwMGIiLCJzY29wZSI6ImF1dGg6dXNlci5pZDpyZWFkIGRvY3g6ZG9jdW1lbnQgd2lraTpub2RlOmNvcHkgd2lraTpub2RlOnJlYWQgd2lraTp3aWtpIHdpa2k6d2lraTpyZWFkb25seSIsImF1dGhfaWQiOiI3NTg2MjMzNDY1Mjc2Nzc5NzExIiwiYXV0aF90aW1lIjoxNzY2MzA3NjIwLCJhdXRoX2V4cCI6MTc5Nzg0MzYyMCwidW5pdCI6ImV1X25jIiwidGVuYW50X3VuaXQiOiJldV9uYyIsIm9wYXF1ZSI6dHJ1ZSwiZW5jIjoiQWlRa0FRRUNBTUlEQUFFQkF3QUNBUTBBQXdzTEFBQUFBd0FBQUFkR1pXRjBkWEpsQUFBQUVHOWhkWFJvWDI5d1lYRjFaVjlxZDNRQUFBQUlWR1Z1WVc1MFNXUUFBQUFCTUFBQUFBUlVhVzFsQUFBQUNqRTNOalUzTlRZNE1EQVBBQVFNQUFBQUFRb0FBV0xGSWxtdmdBQWlDd0FDQUFBQURMTUdFWkxxWlgyUFI4dklBd3NBQXdBQUFEREFodTZTWXZsVDU1Mk5teEZxOW9vYVlrMHI5NTlDeWZvekFISlpyWFZmWGpvY3o1Y0RSakovZnJ6R09kZzdwMklBQ3dBRkFBQUFCV1YxWDI1akFBT0xtTFVOL3dkRGR1cHlzS2pJaUdKeVZNZnV6RlN3V1lhdG9mVW5LNGJrNS9SYjFwWEl0NXc1UXgwZll6Mm80SjJ2R0lVeGZERkZ3NDZMY09NVUIvOFRBTUEzMEluT1dZTVRIWUx5aEpzbTRQeHlNcGlTdDhxeHdkZ09CTEFJZ0lFRWk4V1h6SDNtbzcySm1nMFY1VW9WT28xV3A5dGxndmtOUm82VG9YWEJqbUNwNTJ5a0ZtcjFaVm1OQWoweWsrZ0lYdz09IiwiZW5jX3ZlciI6InYxIn0.pVvuxchp8K06zYOE-dQOnYIVShiMWpV8TtaEpSK_EbhsZhkREaqZjO_oWiTELqXcT6kEY_h_UYDr36ciuD_ypw",
+    "user_access_token_env": "FEISHU_USER_ACCESS_TOKEN",
+    "oauth": {
+      "enabled": true,
+      "app_id": "cli_a6b21804b52b500b",
+      "app_secret": "03QDxSBmkr3CexYkZyDsAEFdfq1itLUh",
+      "redirect_uri": "http://localhost:8000/callback",
+      "scopes": "wiki:wiki wiki:node:read wiki:node:copy docx:document",
+      "open_browser": true,
+      "timeout_sec": 300,
+      "token_timeout_sec": 30,
+      "auto_save_user_access_token": true,
+      "auto_oauth_on_99991677": true
+    },
+    "template_node_token": "E4NRwVTmkigYl0kjStJcu7eYnAb",
+    "template_page_id": "",
+    "target_space_id": "7314490024274378754",
+    "target_parent_token": "",
+    "template_file_token": "",
+    "target_folder_token": "",
+    "name_template": "{{REL_DEVICE_NAME}} {{REL_STAGE}} {{REL_VERSION}}",
+    "placeholder_overrides": {
+      "{{REL_BOOTLOADER_MANIFEST_INFO}}": "",
+      "{{REL_RECOVERY_MANIFEST_INFO}}": "",
+      "{{REL_BUILD_LOG_FILE}}": ""
+    },
+    "parent_block_id": "",
+    "insert_index": -1,
+    "timeout_sec": 30,
+    "debug_dump_response": false
+  }
+}

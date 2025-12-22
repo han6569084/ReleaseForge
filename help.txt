@@ -1,0 +1,17 @@
+python feishu_oauth_get_user_token.py --app-id cli_a6b21804b52b500b --app-secret 03QDxSBmkr3CexYkZyDsAEFdfq1itLUh --scopes "wiki:wiki wiki:node:read wiki:node:copy docx:document"
+
+{{REL_DEVICE_NAME}}：release.project
+{{REL_STAGE}} :release.stage
+{{REL_VERSION}} release.version
+{{REL_BOOTLOADER_MANIFEST_INFO}}: manifest_BOOT_*.xml NAS共享地址（从 step1_archive 解压得到并上传）
+{{REL_RECOVERY_MANIFEST_INFO}}：manifest_RECOVERY_*.xml NAS共享地址（从 step1_archive 解压得到并上传）
+{{REL_APP_MANIFEST_INFO}}：manifest_pamir_64m_3.6.0.3_202512191740.xml 文件上传为单行形式
+{{REL_RELEASE_FULL_ARCHIVE}}: archive_pamir_64m_3.6.0.3_202512191740.tgz NAS共享地址
+{{REL_RELEASE_OTA_CLOUD_ARCHIVE}}: 解压产物ota cloud archiv NAS共享地址
+{{REL_RELEASE_OTA_SIGN_ZIP}}: 解压产物ota.zip NAS共享地址
+{{REL_RELEASE_FACTORY_TOOL_ZIP}}:pamir_64m_factory_3.6.0.3_1.8.0_2025-12-19_18-26-12.zip NAS共享地址
+{{REL_RELEASE_OTA_SLEEP_ARCHIVE}}:archive_OTA_SLEEP_pamir_64m_3.6.0.3_202512191740.tgz NAS共享地址
+{{REL_MONKEY_FULL_ARCHIVE}}:Debug版本的archive_*.tgz（OTA整包）NAS共享地址
+{{REL_MD5SUM_FILE}}:pamir_64m_md5.txt 文件上传为单行形式
+{{REL_CI_BUILD_URL}}：test
+{{REL_BUILD_LOG_FILE}}:test
