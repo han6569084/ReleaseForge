@@ -1,0 +1,314 @@
+{
+  "version": "1.0",
+
+  "prepare": {
+    "flow": {
+      "work_dir": "${prepare.workspace_dir}/release_extract/_work",
+      "upload_payload_dir": "${prepare.workspace_dir}/release_extract/upload_payload",
+      "clean": true,
+
+      "defaults": {
+        "run": "release",
+        "expect": "one",
+        "select": "shortest_path",
+        "match_on": "name"
+      },
+
+      "steps": [
+        {
+          "op": "find",
+          "name": "find release top tgz",
+          "root": "${jenkins.builds.release.download.output_dir}",
+          "match": { "regex": "^archive_${release.project}_.*\\.tgz$" },
+          "save_as": "release_top_tgz"
+        },
+        {
+          "op": "extract_tgz",
+          "name": "extract top tgz to step1",
+          "from": "release_top_tgz",
+          "to": "${prepare.flow.work_dir}/step1_archive_${release.project}",
+          "save_as": "step1_dir"
+        },
+        {
+          "op": "extract_if_single_tar",
+          "name": "extract optional tar layer inside step1",
+          "root": "step1_dir",
+          "to": "${prepare.flow.work_dir}/step1_archive_${release.project}_tar",
+          "save_as": "step1_content_dir"
+        },
+
+        {
+          "op": "pick",
+          "name": "pick OTA_CLOUD tgz from step1",
+          "root": "step1_content_dir",
+          "match": { "regex": "^archive_OTA_CLOUD_.*\\.tgz$" },
+          "save_as": "ota_cloud_tgz"
+        },
+        {
+          "op": "copy_to_payload",
+          "name": "upload OTA_CLOUD tgz",
+          "from": "ota_cloud_tgz",
+          "also_save_as": "ota_cloud_payload"
+        },
+
+        {
+          "op": "pick",
+          "name": "pick OTA_SLEEP tgz from release artifacts (if present)",
+          "root": "${jenkins.builds.release.download.output_dir}",
+          "match": { "regex": "^archive_OTA_SLEEP_.*\\.tgz$" },
+          "save_as": "ota_sleep_tgz",
+          "optional": true
+        },
+        {
+          "op": "copy_to_payload",
+          "name": "upload OTA_SLEEP tgz (if present)",
+          "from": "ota_sleep_tgz",
+          "also_save_as": "ota_sleep_payload",
+          "optional": true
+        },
+
+        {
+          "op": "extract_tgz",
+          "name": "extract OTA_CLOUD tgz",
+          "from": "ota_cloud_tgz",
+          "to": "${prepare.flow.work_dir}/cloud_tgz",
+          "save_as": "cloud_dir"
+        },
+        {
+          "op": "extract_if_single_tar",
+          "name": "extract optional tar layer inside cloud",
+          "root": "cloud_dir",
+          "to": "${prepare.flow.work_dir}/cloud_tar",
+          "save_as": "cloud_content_dir"
+        },
+        {
+          "op": "pick",
+          "name": "pick watch ota_sign zip",
+          "root": "cloud_content_dir",
+          "match": { "exact": "watch@mhs003_ota_sign.zip", "fallback_regex": ".*_ota_sign\\.zip$" },
+          "save_as": "ota_sign_zip"
+        },
+        {
+          "op": "copy_to_payload",
+          "name": "upload ota_sign zip",
+          "from": "ota_sign_zip",
+          "also_save_as": "ota_sign_payload"
+        },
+
+        {
+          "op": "pick",
+          "name": "pick OTA tgz (non-cloud) from step1",
+          "root": "step1_content_dir",
+          "match": { "regex": "^archive_OTA_(?!CLOUD).*(?!SLEEP).*\\.tgz$" },
+          "save_as": "ota_tgz"
+        },
+        {
+          "op": "extract_tgz",
+          "name": "extract OTA tgz",
+          "from": "ota_tgz",
+          "to": "${prepare.flow.work_dir}/ota_tgz",
+          "save_as": "ota_dir"
+        },
+        {
+          "op": "extract_if_single_tar",
+          "name": "extract optional tar layer inside ota",
+          "root": "ota_dir",
+          "to": "${prepare.flow.work_dir}/ota_tar",
+          "save_as": "ota_content_dir"
+        },
+        {
+          "op": "pick",
+          "name": "pick watch@mhs003.elf (prefer under binary)",
+          "root": "ota_content_dir",
+          "match": { "exact": "watch@mhs003.elf" },
+          "save_as": "watch_elf"
+        },
+        {
+          "op": "copy_to_payload",
+          "name": "upload watch@mhs003.elf",
+          "from": "watch_elf",
+          "also_save_as": "watch_elf_payload"
+        },
+
+        {
+          "op": "pick",
+          "name": "pick archive_BOOT tgz from step1",
+          "root": "step1_content_dir",
+          "match": { "regex": "^archive_BOOT_.*\\.tgz$" },
+          "save_as": "boot_tgz",
+          "optional": true
+        },
+        {
+          "op": "extract_tgz",
+          "name": "extract BOOT tgz",
+          "from": "boot_tgz",
+          "to": "${prepare.flow.work_dir}/boot_tgz",
+          "save_as": "boot_dir",
+          "optional": true
+        },
+        {
+          "op": "extract_if_single_tar",
+          "name": "extract optional tar layer inside boot",
+          "root": "boot_dir",
+          "to": "${prepare.flow.work_dir}/boot_tar",
+          "save_as": "boot_content_dir",
+          "optional": true
+        },
+        {
+          "op": "pick",
+          "name": "pick manifest_BOOT xml",
+          "root": "boot_content_dir",
+          "match": { "regex": "^manifest_BOOT_.*\\.xml$" },
+          "save_as": "boot_manifest_xml",
+          "optional": true
+        },
+        {
+          "op": "copy_to_payload",
+          "name": "upload manifest_BOOT xml",
+          "from": "boot_manifest_xml",
+          "also_save_as": "boot_manifest_payload",
+          "optional": true
+        },
+
+        {
+          "op": "pick",
+          "name": "pick archive_RECOVERY tgz from step1",
+          "root": "step1_content_dir",
+          "match": { "regex": "^archive_RECOVERY_.*\\.tgz$" },
+          "save_as": "recovery_tgz",
+          "optional": true
+        },
+        {
+          "op": "extract_tgz",
+          "name": "extract RECOVERY tgz",
+          "from": "recovery_tgz",
+          "to": "${prepare.flow.work_dir}/recovery_tgz",
+          "save_as": "recovery_dir",
+          "optional": true
+        },
+        {
+          "op": "extract_if_single_tar",
+          "name": "extract optional tar layer inside recovery",
+          "root": "recovery_dir",
+          "to": "${prepare.flow.work_dir}/recovery_tar",
+          "save_as": "recovery_content_dir",
+          "optional": true
+        },
+        {
+          "op": "pick",
+          "name": "pick manifest_RECOVERY xml",
+          "root": "recovery_content_dir",
+          "match": { "regex": "^manifest_RECOVERY_.*\\.xml$" },
+          "save_as": "recovery_manifest_xml",
+          "optional": true
+        },
+        {
+          "op": "copy_to_payload",
+          "name": "upload manifest_RECOVERY xml",
+          "from": "recovery_manifest_xml",
+          "also_save_as": "recovery_manifest_payload",
+          "optional": true
+        },
+
+        {
+          "op": "find",
+          "name": "find debug full archive tgz (OTA整包)",
+          "run": "debug",
+          "root": "${jenkins.builds.debug.download.output_dir}",
+          "match": { "regex": "^archive_${release.project}[A-Za-z0-9_-]*_.*\\.tgz$" },
+          "save_as": "debug_full_archive_tgz",
+          "optional": true
+        },
+        {
+          "op": "copy_to_payload",
+          "name": "upload debug full archive tgz (OTA整包)",
+          "run": "debug",
+          "from": "debug_full_archive_tgz",
+          "also_save_as": "debug_full_archive_payload",
+          "optional": true
+        }
+      ]
+    }
+  },
+
+  "placeholders": {
+    "strategy": {
+      "nas_share_priority": ["local_dsm_create_share_link", "run_summary_share_links"],
+      "missing_placeholder": "keep"
+    },
+
+    "mappings": {
+      "{{REL_DEVICE_NAME}}": { "mode": "var", "path": "release.device_name", "required": true },
+      "{{REL_STAGE}}": { "mode": "var", "path": "release.stage" },
+      "{{REL_VERSION}}": { "mode": "var", "path": "release.version", "required": true },
+
+      "{{REL_CI_BUILD_URL}}": { "mode": "var", "path": "jenkins.builds.release.build_url" },
+
+      "{{REL_BOOTLOADER_MANIFEST_INFO}}": {
+        "mode": "nas_share",
+        "run": "release",
+        "from": "boot_manifest_payload",
+        "required": true
+      },
+      "{{REL_RECOVERY_MANIFEST_INFO}}": {
+        "mode": "nas_share",
+        "run": "release",
+        "from": "recovery_manifest_payload",
+        "required": true
+      },
+
+      "{{REL_APP_MANIFEST_INFO}}": {
+        "mode": "nas_share",
+        "run": "release",
+        "match": { "regex": "^manifest_.*${release.project}.*\\.xml$" },
+        "required": false
+      },
+
+      "{{REL_RELEASE_FULL_ARCHIVE}}": {
+        "mode": "nas_share",
+        "run": "release",
+        "match": { "regex": "^archive_${release.device_name}[A-Za-z0-9_-]*_.*\\.tgz$" },
+        "required": true
+      },
+      "{{REL_RELEASE_OTA_CLOUD_ARCHIVE}}": {
+        "mode": "nas_share",
+        "run": "release",
+        "from": "ota_cloud_payload",
+        "required": true
+      },
+      "{{REL_RELEASE_OTA_SLEEP_ARCHIVE}}": {
+        "mode": "nas_share",
+        "run": "release",
+        "from": "ota_sleep_payload",
+        "required": false
+      },
+      "{{REL_RELEASE_OTA_SIGN_ZIP}}": {
+        "mode": "nas_share",
+        "run": "release",
+        "from": "ota_sign_payload",
+        "required": true
+      },
+      "{{REL_RELEASE_FACTORY_TOOL_ZIP}}": {
+        "mode": "nas_share",
+        "run": "release",
+        "match": { "regex": ".*factory.*\\.zip$" },
+        "required": true
+      },
+
+      "{{REL_MONKEY_FULL_ARCHIVE}}": {
+        "mode": "nas_share",
+        "run": "debug",
+        "from": "debug_full_archive_payload",
+        "required": false
+      },
+
+      "{{REL_MD5SUM_FILE}}": {
+        "mode": "nas_share",
+        "run": "release",
+        "match": { "regex": ".*md5.*\\.txt$|md5\\.txt$|_md5\\.txt$|md5sum\\.txt$" }
+      },
+
+      "{{REL_BUILD_LOG_FILE}}": { "mode": "const", "value": "" }
+    }
+  }
+}

@@ -1080,6 +1080,487 @@ def _expand_placeholders(value: Any, ctx: Dict[str, Any]) -> Any:
     return value
 
 
+def _dsl_string_is_var_ref(s: str, vars: Dict[str, Any]) -> bool:
+    ss = str(s or "").strip()
+    return bool(ss) and (ss in vars)
+
+
+def _dsl_resolve_ref_or_path(value: Any, *, vars: Dict[str, Any], what: str) -> Path:
+    if isinstance(value, str) and _dsl_string_is_var_ref(value, vars):
+        v = vars.get(value)
+        if isinstance(v, Path):
+            return v
+        if isinstance(v, str):
+            return Path(v)
+        raise RuntimeError(f"DSL: var ref {value!r} for {what} is not a path: {type(v)}")
+    if not isinstance(value, str) or not str(value).strip():
+        raise RuntimeError(f"DSL: missing {what}")
+    return Path(str(value)).expanduser().resolve()
+
+
+def _dsl_pick_one(paths: List[Path], *, expect: str, select: str, what: str) -> Path:
+    exp = str(expect or "one").strip().lower() or "one"
+    sel = str(select or "shortest_path").strip().lower() or "shortest_path"
+    if exp != "one":
+        raise RuntimeError(f"DSL: only expect='one' is supported for now (got {expect!r})")
+    if sel != "shortest_path":
+        raise RuntimeError(f"DSL: only select='shortest_path' is supported for now (got {select!r})")
+    return _pick_one(paths, what=what)
+
+
+def _dsl_match_files(*, root: Path, match: Dict[str, Any], match_on: str) -> List[Path]:
+    if not root.exists():
+        return []
+
+    mon = str(match_on or "name").strip().lower() or "name"
+    if mon not in ("name", "path"):
+        raise RuntimeError(f"DSL: unsupported match_on={match_on!r}")
+
+    exact = str(match.get("exact") or "").strip()
+    regex = str(match.get("regex") or "").strip()
+    fallback_regex = str(match.get("fallback_regex") or "").strip()
+
+    def _target_str(p: Path) -> str:
+        if mon == "path":
+            try:
+                return p.relative_to(root).as_posix()
+            except Exception:
+                return p.as_posix()
+        return p.name
+
+    matches: List[Path] = []
+    if exact:
+        for p in sorted(root.rglob("*")):
+            if p.is_file() and _target_str(p) == exact:
+                matches.append(p)
+        if matches:
+            return matches
+        if fallback_regex:
+            regex = fallback_regex
+        else:
+            return []
+
+    if regex:
+        pat = re.compile(regex, re.IGNORECASE)
+        for p in sorted(root.rglob("*")):
+            if p.is_file() and pat.search(_target_str(p)):
+                matches.append(p)
+        return matches
+
+    # No match criteria => match nothing (safer than match all).
+    return []
+
+
+def _dsl_extract_tgz(*, src: Path, dest: Path, dry_run: bool) -> None:
+    if dry_run:
+        print(f"DSL Prepare: dry-run; would extract tgz: {src} -> {dest}")
+        return
+    dest.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(src, mode="r:gz") as tf:
+        _safe_extract_tar(tf, dest)
+
+
+def _dsl_extract_tar(*, src: Path, dest: Path, dry_run: bool) -> None:
+    if dry_run:
+        print(f"DSL Prepare: dry-run; would extract tar: {src} -> {dest}")
+        return
+    dest.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(src, mode="r:") as tf:
+        _safe_extract_tar(tf, dest)
+
+
+def _dsl_execute_prepare_flow(
+    *,
+    cfg: Dict[str, Any],
+    dsl_cfg: Dict[str, Any],
+    dry_run: bool,
+    current_run: str,
+    existing_vars: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Execute prepare.flow.steps and return a runtime object.
+
+    Returns:
+      {
+        "vars": {name: Path|str},
+        "work_dir": Path,
+        "upload_payload_dir": Path,
+        "run_summaries_extra_dir": str,
+      }
+    """
+
+    prep = dsl_cfg.get("prepare") or {}
+    if not isinstance(prep, dict):
+        raise RuntimeError("DSL: prepare must be an object")
+    flow = prep.get("flow") or {}
+    if not isinstance(flow, dict):
+        raise RuntimeError("DSL: prepare.flow must be an object")
+
+    work_dir = Path(str(flow.get("work_dir") or "")).expanduser().resolve()
+    upload_payload_dir = Path(str(flow.get("upload_payload_dir") or "")).expanduser().resolve()
+    clean = bool(flow.get("clean", False))
+    defaults = flow.get("defaults") or {}
+    if not isinstance(defaults, dict):
+        defaults = {}
+
+    if not work_dir:
+        raise RuntimeError("DSL: prepare.flow.work_dir is missing")
+    if not upload_payload_dir:
+        raise RuntimeError("DSL: prepare.flow.upload_payload_dir is missing")
+
+    if dry_run:
+        print(f"DSL Prepare: dry-run; work_dir={work_dir}")
+        print(f"DSL Prepare: dry-run; upload_payload_dir={upload_payload_dir}")
+    else:
+        if clean and work_dir.exists():
+            shutil.rmtree(work_dir)
+        if clean and upload_payload_dir.exists():
+            shutil.rmtree(upload_payload_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        upload_payload_dir.mkdir(parents=True, exist_ok=True)
+
+    steps = flow.get("steps") or []
+    if not isinstance(steps, list):
+        raise RuntimeError("DSL: prepare.flow.steps must be an array")
+
+    vars: Dict[str, Any] = dict(existing_vars or {})
+    vars.setdefault("work_dir", work_dir)
+    vars.setdefault("upload_payload_dir", upload_payload_dir)
+
+    for idx, step in enumerate(steps, start=1):
+        if not isinstance(step, dict):
+            raise RuntimeError(f"DSL: step #{idx} must be an object")
+        op = str(step.get("op") or "").strip()
+        name = str(step.get("name") or op or f"step_{idx}").strip()
+        optional = bool(step.get("optional", False))
+        expect = str(step.get("expect") or defaults.get("expect") or "one")
+        select = str(step.get("select") or defaults.get("select") or "shortest_path")
+        match_on = str(step.get("match_on") or defaults.get("match_on") or "name")
+
+        step_run = str(step.get("run") or defaults.get("run") or "").strip().lower()
+        if step_run and step_run != str(current_run or "").strip().lower():
+            continue
+
+        try:
+            if op == "find":
+                root = _dsl_resolve_ref_or_path(step.get("root"), vars=vars, what=f"{name}.root")
+                match = step.get("match") or {}
+                if not isinstance(match, dict):
+                    raise RuntimeError(f"DSL: {name}.match must be an object")
+                save_as = str(step.get("save_as") or "").strip()
+                if not save_as:
+                    raise RuntimeError(f"DSL: {name} missing save_as")
+                if dry_run:
+                    print(f"DSL Prepare: dry-run; would find under {root} match={match}")
+                    exact = str(match.get("exact") or "").strip()
+                    dummy_name = exact or f"{save_as}.dryrun"
+                    vars[save_as] = (root / dummy_name)
+                else:
+                    found = _dsl_match_files(root=root, match=match, match_on=match_on)
+                    chosen = _dsl_pick_one(found, expect=expect, select=select, what=f"{name} (find)")
+                    vars[save_as] = chosen
+
+            elif op == "pick":
+                root = _dsl_resolve_ref_or_path(step.get("root"), vars=vars, what=f"{name}.root")
+                match = step.get("match") or {}
+                if not isinstance(match, dict):
+                    raise RuntimeError(f"DSL: {name}.match must be an object")
+                save_as = str(step.get("save_as") or "").strip()
+                if not save_as:
+                    raise RuntimeError(f"DSL: {name} missing save_as")
+                if dry_run:
+                    print(f"DSL Prepare: dry-run; would pick under {root} match={match}")
+                    exact = str(match.get("exact") or "").strip()
+                    dummy_name = exact or f"{save_as}.dryrun"
+                    vars[save_as] = (root / dummy_name)
+                else:
+                    found = _dsl_match_files(root=root, match=match, match_on=match_on)
+                    chosen = _dsl_pick_one(found, expect=expect, select=select, what=f"{name} (pick)")
+                    vars[save_as] = chosen
+
+            elif op == "extract_tgz":
+                src = _dsl_resolve_ref_or_path(step.get("from"), vars=vars, what=f"{name}.from")
+                dest = _dsl_resolve_ref_or_path(step.get("to"), vars=vars, what=f"{name}.to")
+                _dsl_extract_tgz(src=src, dest=dest, dry_run=dry_run)
+                save_as = str(step.get("save_as") or "").strip()
+                if save_as:
+                    vars[save_as] = dest
+
+            elif op == "extract_if_single_tar":
+                root = _dsl_resolve_ref_or_path(step.get("root"), vars=vars, what=f"{name}.root")
+                dest = _dsl_resolve_ref_or_path(step.get("to"), vars=vars, what=f"{name}.to")
+                tar_files = [p for p in root.rglob("*.tar") if p.is_file()] if root.exists() else []
+                if not tar_files:
+                    out_dir = root
+                else:
+                    tar_path = _dsl_pick_one(tar_files, expect=expect, select=select, what=f"{name} (*.tar)")
+                    _dsl_extract_tar(src=tar_path, dest=dest, dry_run=dry_run)
+                    out_dir = dest
+                save_as = str(step.get("save_as") or "").strip()
+                if save_as:
+                    vars[save_as] = out_dir
+
+            elif op == "copy_to_payload":
+                src = _dsl_resolve_ref_or_path(step.get("from"), vars=vars, what=f"{name}.from")
+                to_raw = step.get("to")
+                if isinstance(to_raw, str) and str(to_raw).strip():
+                    dest = _dsl_resolve_ref_or_path(to_raw, vars=vars, what=f"{name}.to")
+                else:
+                    dest = upload_payload_dir / src.name
+
+                if dry_run:
+                    print(f"DSL Prepare: dry-run; would copy: {src} -> {dest}")
+                else:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dest)
+
+                also = str(step.get("also_save_as") or "").strip()
+                if also:
+                    vars[also] = dest
+
+            else:
+                raise RuntimeError(f"DSL: unsupported op={op!r} ({name})")
+
+        except Exception as e:
+            if optional:
+                print(f"DSL Prepare: optional step skipped: {name} ({op}): {e}")
+                save_as = str(step.get("save_as") or "").strip()
+                if save_as and save_as not in vars:
+                    vars[save_as] = ""
+                also = str(step.get("also_save_as") or "").strip()
+                if also and also not in vars:
+                    vars[also] = ""
+                continue
+            raise
+
+    return {"vars": vars, "work_dir": work_dir, "upload_payload_dir": upload_payload_dir}
+
+
+def _dsl_find_share_link_for_filename(run_summary: Dict[str, Any], *, filename: str) -> str:
+    fn = str(filename or "").strip()
+    if not fn:
+        return ""
+    for k, url in _iter_all_share_links(run_summary):
+        key_str = str(k)
+        base = key_str.replace("\\", "/").rsplit("/", 1)[-1]
+        if base == fn or key_str == fn:
+            return str(url)
+    return ""
+
+
+def _dsl_try_dsm_share_link_for_local_path(
+    *,
+    cfg: Dict[str, Any],
+    run_summary: Dict[str, Any],
+    local_path: Path,
+) -> str:
+    remote_dir = str(run_summary.get("remote_dir") or "").strip().rstrip("/")
+    if not remote_dir:
+        return ""
+
+    # Build roots from local_dir + extra_dirs.
+    roots: List[Path] = []
+    for key in ("local_dir",):
+        v = str(run_summary.get(key) or "").strip()
+        if v:
+            roots.append(Path(v).expanduser().resolve())
+    for x in (run_summary.get("extra_dirs") or []):
+        xs = str(x or "").strip()
+        if xs:
+            roots.append(Path(xs).expanduser().resolve())
+
+    # DSM client (reuse the same logic as _build_placeholder_replacements)
+    nas_cfg = cfg.get("nas") or {}
+    if not isinstance(nas_cfg, dict):
+        return ""
+    dsm_cfg = nas_cfg.get("dsm") or {}
+    if not isinstance(dsm_cfg, dict):
+        dsm_cfg = {}
+    dsm_base_url = str(dsm_cfg.get("base_url") or "").strip()
+    if not dsm_base_url:
+        webdav_cfg = nas_cfg.get("webdav") or {}
+        if isinstance(webdav_cfg, dict):
+            dsm_base_url = _derive_dsm_base_url_from_webdav(str(webdav_cfg.get("base_url") or "").strip())
+    if not dsm_base_url:
+        return ""
+    dsm_verify_tls = bool(dsm_cfg.get("verify_tls", False))
+    auth_cfg = dsm_cfg.get("auth") or {}
+    if not isinstance(auth_cfg, dict):
+        auth_cfg = {}
+    dsm_user = str(auth_cfg.get("username") or "").strip()
+    dsm_pass = str(auth_cfg.get("password") or "").strip()
+    if not dsm_pass:
+        dsm_pass = (os.environ.get("DSM_PASSWORD") or os.environ.get("SYNO_PASS") or "").strip()
+    if not dsm_user or not dsm_pass:
+        return ""
+    timeout_sec = int(((nas_cfg.get("webdav") or {}) if isinstance(nas_cfg.get("webdav"), dict) else {}).get("timeout_sec") or 30)
+
+    rel = ""
+    for r in roots:
+        try:
+            rel = local_path.relative_to(r).as_posix()
+            break
+        except Exception:
+            continue
+    candidates: List[str] = []
+    if rel:
+        candidates.append(f"{remote_dir}/{rel}")
+    candidates.append(f"{remote_dir}/{local_path.name}")
+
+    client = SynologyDsmClient(dsm_base_url, verify_tls=dsm_verify_tls, timeout_sec=timeout_sec)
+    client.login(username=dsm_user, password=dsm_pass)
+    try:
+        for rp in candidates:
+            try:
+                return client.create_share_link(path=rp)
+            except Exception:
+                continue
+        return ""
+    finally:
+        try:
+            client.logout()
+        except Exception:
+            pass
+
+
+def _build_placeholder_replacements_from_dsl(
+    *,
+    cfg: Dict[str, Any],
+    run_summaries: List[Dict[str, Any]],
+    dsl_cfg: Dict[str, Any],
+    dsl_runtime: Dict[str, Any],
+) -> Dict[str, str]:
+    placeholders = dsl_cfg.get("placeholders") or {}
+    if not isinstance(placeholders, dict):
+        raise RuntimeError("DSL: placeholders must be an object")
+    strategy = placeholders.get("strategy") or {}
+    if not isinstance(strategy, dict):
+        strategy = {}
+    mappings = placeholders.get("mappings") or {}
+    if not isinstance(mappings, dict):
+        raise RuntimeError("DSL: placeholders.mappings must be an object")
+
+    nas_share_priority = strategy.get("nas_share_priority") or ["local_dsm_create_share_link", "run_summary_share_links"]
+    if not isinstance(nas_share_priority, list):
+        nas_share_priority = ["local_dsm_create_share_link", "run_summary_share_links"]
+    missing_policy = str(strategy.get("missing_placeholder") or "keep").strip().lower() or "keep"
+
+    vars: Dict[str, Any] = dsl_runtime.get("vars") or {}
+
+    def _get_run_sum(name: str) -> Dict[str, Any]:
+        try:
+            return _get_run_summary(run_summaries, name)
+        except Exception:
+            return {}
+
+    out: Dict[str, str] = {str(k): "" for k in mappings.keys()}
+
+    for ph, rule in mappings.items():
+        phs = str(ph)
+        if not phs.strip():
+            continue
+        if not isinstance(rule, dict):
+            raise RuntimeError(f"DSL: mapping for {phs} must be an object")
+
+        mode = str(rule.get("mode") or "").strip().lower()
+        required = bool(rule.get("required", False))
+        run_name = str(rule.get("run") or "").strip().lower() or "release"
+        run_sum = _get_run_sum(run_name)
+
+        val = ""
+        if mode == "var":
+            path = str(rule.get("path") or "").strip()
+            if not path:
+                raise RuntimeError(f"DSL: var mapping for {phs} missing path")
+            try:
+                v = _get_by_dotted_path(cfg, path)
+                val = "" if v is None else str(v)
+            except Exception:
+                val = ""
+
+        elif mode == "const":
+            val = "" if rule.get("value") is None else str(rule.get("value"))
+
+        elif mode == "nas_share":
+            local_path: Optional[Path] = None
+            if rule.get("from"):
+                ref = str(rule.get("from") or "").strip()
+                v = vars.get(ref)
+                if isinstance(v, Path):
+                    local_path = v
+                elif isinstance(v, str) and v.strip():
+                    local_path = Path(v).expanduser().resolve()
+
+            if local_path is None and isinstance(rule.get("match"), dict):
+                # Resolve local file by match within run roots.
+                m = rule.get("match") or {}
+                mon = str(rule.get("match_on") or "name").strip().lower() or "name"
+                roots: List[Path] = []
+                for key in ("local_dir", "out_dir"):
+                    vroot = str(run_sum.get(key) or "").strip()
+                    if vroot:
+                        roots.append(Path(vroot).expanduser().resolve())
+                for x in (run_sum.get("extra_dirs") or []):
+                    xs = str(x or "").strip()
+                    if xs:
+                        roots.append(Path(xs).expanduser().resolve())
+
+                candidates: List[Path] = []
+                for r in roots:
+                    candidates.extend(_dsl_match_files(root=r, match=m, match_on=mon))
+                if candidates:
+                    local_path = _dsl_pick_one(candidates, expect=str(rule.get("expect") or "one"), select=str(rule.get("select") or "shortest_path"), what=f"{phs} local match")
+
+            # Resolve share link by priority.
+            filename = local_path.name if local_path else ""
+            for how in [str(x) for x in nas_share_priority]:
+                if how == "run_summary_share_links":
+                    if local_path is not None:
+                        val = _dsl_find_share_link_for_filename(run_sum, filename=filename)
+                    elif isinstance(rule.get("match"), dict):
+                        m = rule.get("match") or {}
+                        if isinstance(m, dict) and str(m.get("regex") or "").strip():
+                            try:
+                                val = _find_share_link_by_regex(run_sum, filename_regex=re.compile(str(m.get("regex")), re.IGNORECASE), what=phs)
+                            except Exception:
+                                val = ""
+                    if val:
+                        break
+                elif how == "local_dsm_create_share_link":
+                    if local_path is not None:
+                        val = _dsl_try_dsm_share_link_for_local_path(cfg=cfg, run_summary=run_sum, local_path=local_path)
+                    if val:
+                        break
+
+        else:
+            raise RuntimeError(f"DSL: unsupported placeholder mode={mode!r} for {phs}")
+
+        if required and not str(val or "").strip():
+            raise RuntimeError(f"DSL: required placeholder missing: {phs}")
+
+        if not str(val or "").strip() and missing_policy == "keep":
+            out[phs] = ""
+        else:
+            out[phs] = "" if val is None else str(val)
+
+    # User overrides (same semantics as legacy: empty string does NOT override)
+    feishu_cfg = cfg.get("feishu") or {}
+    if isinstance(feishu_cfg, dict):
+        overrides = feishu_cfg.get("placeholder_overrides")
+        if isinstance(overrides, dict):
+            for k, v in overrides.items():
+                ks = str(k)
+                if not ks:
+                    continue
+                if v is None:
+                    continue
+                vs = str(v)
+                if not vs.strip():
+                    continue
+                out[ks] = vs
+
+    return {k: ("" if v is None else str(v)) for k, v in out.items() if str(k).strip()}
+
+
 def _pattern_variants(pat: str) -> List[str]:
     # Jenkins artifacts often include both top-level files (e.g. 'a.zip') and nested paths.
     # Patterns like '**/*' or '**/*.log' should match BOTH cases.
@@ -2000,6 +2481,50 @@ def main() -> int:
     prepare_cfg = cfg.get("prepare", {}) or {}
     prepare_mode = str(prepare_cfg.get("mode", "none")).strip()
 
+    # Optional: JSON-driven prepare/placeholder mapping DSL.
+    dsl_cfg: Optional[Dict[str, Any]] = None
+    dsl_runtime: Optional[Dict[str, Any]] = None
+    if prepare_mode.strip().lower() in ("placeholders_dsl", "dsl"):
+        dsl_path_value = (
+            prepare_cfg.get("placeholders_config")
+            or prepare_cfg.get("flow_config")
+            or prepare_cfg.get("placeholders_flow_config")
+            or prepare_cfg.get("placeholders_config_path")
+        )
+        if not dsl_path_value:
+            raise SystemExit(
+                "prepare.mode=placeholders_dsl requires prepare.placeholders_config (path to *.placeholders.json)"
+            )
+
+        dsl_path = _resolve_cfg_path(dsl_path_value)
+        dsl_raw = json.loads(dsl_path.read_text(encoding="utf-8"))
+        if not isinstance(dsl_raw, dict):
+            raise SystemExit(f"Invalid DSL json (expected object): {dsl_path}")
+
+        # Multi-pass expansion:
+        # - flow.* may reference prepare.flow.* (self-references) and prepare.* from main config.
+        # - We expand flow with a context that includes the current flow, iterating until stable.
+        # - Then expand the whole DSL using cfg + expanded flow so ${prepare.flow.work_dir} works.
+        flow0 = (((dsl_raw.get("prepare") or {}) if isinstance(dsl_raw.get("prepare"), dict) else {}).get("flow") or {})
+        if not isinstance(flow0, dict):
+            raise SystemExit(f"Invalid DSL prepare.flow (expected object): {dsl_path}")
+        cfg_prepare2 = (cfg.get("prepare") or {}) if isinstance(cfg.get("prepare"), dict) else {}
+
+        flow_cur: Any = flow0
+        for _ in range(6):
+            ctx_loop = dict(cfg)
+            ctx_loop["prepare"] = {**cfg_prepare2, "flow": flow_cur}
+            flow_next = _expand_placeholders(flow_cur, ctx_loop)
+            if flow_next == flow_cur:
+                break
+            flow_cur = flow_next
+        flow1 = flow_cur
+
+        ctx2 = dict(cfg)
+        ctx2["prepare"] = {**cfg_prepare2, "flow": flow1}
+        dsl_cfg = _expand_placeholders(dsl_raw, ctx2)
+        dsl_runtime = {"dsl_path": str(dsl_path), "vars": {}}
+
     uploader_script = Path(__file__).with_name("nas_webdav_upload.py")
     if not uploader_script.exists():
         raise SystemExit(f"Missing uploader script: {uploader_script}")
@@ -2074,6 +2599,28 @@ def main() -> int:
         else:
             print("Skip Jenkins download.")
 
+        # DSL prepare (per-run): execute only steps matching this run name.
+        if not args.skip_prepare and prepare_mode.strip().lower() in ("placeholders_dsl", "dsl"):
+            if dsl_cfg is None or dsl_runtime is None:
+                raise RuntimeError("prepare.mode=placeholders_dsl but DSL config failed to load")
+            print(f"Prepare: placeholders_dsl ({name}) from: {dsl_runtime.get('dsl_path')}")
+            res = _dsl_execute_prepare_flow(
+                cfg=cfg,
+                dsl_cfg=dsl_cfg,
+                dry_run=args.dry_run,
+                current_run=name,
+                existing_vars=(dsl_runtime.get("vars") if isinstance(dsl_runtime.get("vars"), dict) else {}),
+            )
+            dsl_runtime.update(res)
+
+            # Ensure payload dir is uploaded/shared for both runs.
+            try:
+                payload_dir = Path(str(res["upload_payload_dir"]))
+                if str(payload_dir) not in [str(x) for x in extra_local_dirs]:
+                    extra_local_dirs.append(str(payload_dir))
+            except Exception:
+                pass
+
         upload_spec = uploads_by_name.get(name)
         if not upload_spec:
             raise RuntimeError(f"Missing nas.uploads entry for '{name}'")
@@ -2083,7 +2630,7 @@ def main() -> int:
         local_dir = str(local_dir_path)
         extra_local_dirs = [str(_resolve_cfg_path(x)) for x in _normalize_extra_local_dirs(upload_spec.get("extra_local_dirs"))]
 
-        # Prepare stage (currently supports release-specific extraction)
+        # Prepare stage (legacy release_extract)
         prepared_dir: Optional[Path] = None
         if not args.skip_prepare and name == "release" and prepare_mode == "release_extract":
             workspace_dir = _resolve_cfg_path(prepare_cfg.get("workspace_dir") or (Path(__file__).with_name("work") / "prepare"))
@@ -2102,6 +2649,14 @@ def main() -> int:
             # If user didn't specify extra_local_dirs explicitly, auto-add staged dir.
             if not extra_local_dirs:
                 extra_local_dirs = [str(prepared_dir)]
+
+        if prepare_mode.strip().lower() in ("placeholders_dsl", "dsl") and dsl_runtime is not None:
+            try:
+                prepared_dir = Path(str(dsl_runtime.get("upload_payload_dir") or "")).expanduser().resolve()
+                if str(prepared_dir).strip():
+                    print(f"Prepare: staged files in: {prepared_dir}")
+            except Exception:
+                prepared_dir = None
 
         if args.skip_upload:
             print("Skip NAS upload.")
@@ -2544,7 +3099,15 @@ def main() -> int:
                 # docx operations are disabled or fail due to permissions.
                 if feishu_print_placeholder_mapping:
                     try:
-                        mapping = _build_placeholder_replacements(cfg=cfg, run_summaries=run_summaries)
+                        if dsl_cfg is not None and dsl_runtime is not None and prepare_mode.strip().lower() in ("placeholders_dsl", "dsl"):
+                            mapping = _build_placeholder_replacements_from_dsl(
+                                cfg=cfg,
+                                run_summaries=run_summaries,
+                                dsl_cfg=dsl_cfg,
+                                dsl_runtime=dsl_runtime,
+                            )
+                        else:
+                            mapping = _build_placeholder_replacements(cfg=cfg, run_summaries=run_summaries)
                         mp = _write_placeholder_mapping_file(mapping=mapping, doc_name=doc_name)
                         print(f"Feishu placeholder mapping: {mp}")
                     except Exception as e:
@@ -2566,7 +3129,15 @@ def main() -> int:
                 # Optional: replace placeholders in the copied docx template.
                 if feishu_docx_replace_placeholders:
                     def _do_replace() -> Dict[str, Any]:
-                        mapping_now = _build_placeholder_replacements(cfg=cfg, run_summaries=run_summaries)
+                        if dsl_cfg is not None and dsl_runtime is not None and prepare_mode.strip().lower() in ("placeholders_dsl", "dsl"):
+                            mapping_now = _build_placeholder_replacements_from_dsl(
+                                cfg=cfg,
+                                run_summaries=run_summaries,
+                                dsl_cfg=dsl_cfg,
+                                dsl_runtime=dsl_runtime,
+                            )
+                        else:
+                            mapping_now = _build_placeholder_replacements(cfg=cfg, run_summaries=run_summaries)
                         print("Feishu Docx: replacing placeholders in template...")
                         rep0 = _feishu_docx_replace_placeholders_in_document(
                             user_access_token=user_token,

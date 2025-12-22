@@ -10,7 +10,7 @@ python feishu_oauth_get_user_token.py --app-id cli_a6b21804b52b500b --app-secret
 {{REL_RELEASE_OTA_CLOUD_ARCHIVE}}: 解压产物ota cloud archiv NAS共享地址
 {{REL_RELEASE_OTA_SIGN_ZIP}}: 解压产物ota.zip NAS共享地址
 {{REL_RELEASE_FACTORY_TOOL_ZIP}}:pamir_64m_factory_3.6.0.3_1.8.0_2025-12-19_18-26-12.zip NAS共享地址
-{{REL_RELEASE_OTA_SLEEP_ARCHIVE}}:archive_OTA_SLEEP_pamir_64m_3.6.0.3_202512191740.tgz NAS共享地址
+{{REL_RELEASE_OTA_SLEEP_ARCHIVE}}: Release 直接产物下的 archive_OTA_SLEEP_*.tgz NAS共享地址
 {{REL_MONKEY_FULL_ARCHIVE}}:Debug版本的archive_*.tgz（OTA整包）NAS共享地址
 {{REL_MD5SUM_FILE}}:pamir_64m_md5.txt 文件上传为单行形式
 {{REL_CI_BUILD_URL}}：test

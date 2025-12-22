@@ -1,0 +1,309 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/release_fw/placeholders.schema.json",
+  "title": "release_fw placeholders + prepare flow schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "prepare", "placeholders"],
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "Schema version for this DSL.",
+      "default": "1.0"
+    },
+    "prepare": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["flow"],
+      "properties": {
+        "flow": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["work_dir", "upload_payload_dir", "steps"],
+          "properties": {
+            "work_dir": {
+              "type": "string",
+              "description": "Workspace directory used for extracted intermediate artifacts (can contain ${...} placeholders)."
+            },
+            "upload_payload_dir": {
+              "type": "string",
+              "description": "Directory whose contents will be uploaded to NAS as an extra dir (can contain ${...} placeholders)."
+            },
+            "defaults": {
+              "type": "object",
+              "description": "Optional defaults to reduce per-step repetition. Execution engine may apply these when fields are omitted.",
+              "additionalProperties": false,
+              "properties": {
+                "run": {
+                  "type": "string",
+                  "enum": ["release", "debug"],
+                  "default": "release"
+                },
+                "expect": {
+                  "type": "string",
+                  "enum": ["one", "at_least_one", "any"],
+                  "default": "one"
+                },
+                "select": {
+                  "type": "string",
+                  "enum": ["shortest_path", "lexicographic", "newest_mtime"],
+                  "default": "shortest_path"
+                },
+                "match_on": {
+                  "type": "string",
+                  "description": "Default match target.",
+                  "enum": ["name", "path"],
+                  "default": "name"
+                }
+              }
+            },
+            "clean": {
+              "type": "boolean",
+              "description": "If true, clean work_dir/upload_payload_dir before running prepare.",
+              "default": true
+            },
+            "steps": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/definitions/step" }
+            }
+          }
+        }
+      }
+    },
+    "placeholders": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategy", "mappings"],
+      "properties": {
+        "strategy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "nas_share_priority": {
+              "type": "array",
+              "description": "Preferred order to resolve NAS share links.",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "local_dsm_create_share_link",
+                  "run_summary_share_links"
+                ]
+              },
+              "default": ["local_dsm_create_share_link", "run_summary_share_links"]
+            },
+            "missing_placeholder": {
+              "type": "string",
+              "description": "Behavior when a placeholder cannot be resolved.",
+              "enum": ["keep", "empty", "error"],
+              "default": "keep"
+            }
+          }
+        },
+        "mappings": {
+          "type": "object",
+          "description": "Mapping table from placeholder (e.g. {{REL_VERSION}}) to a value rule.",
+          "additionalProperties": { "$ref": "#/definitions/placeholderRule" }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op"],
+      "properties": {
+        "op": {
+          "type": "string",
+          "description": "Operation type.",
+          "enum": [
+            "find",
+            "pick",
+            "extract_tgz",
+            "extract_tar",
+            "extract_if_single_tar",
+            "copy_to_payload"
+          ]
+        },
+        "name": {
+          "type": "string",
+          "description": "Optional human-readable name for logs."
+        },
+        "run": {
+          "type": "string",
+          "description": "Logical run that this step belongs to (influences roots in future executor).",
+          "enum": ["release", "debug"],
+          "default": "release"
+        },
+
+        "root": {
+          "type": "string",
+          "description": "Directory to search in for find/pick. Can be a literal path, a ${...} placeholder string, or a variable name from a previous step."
+        },
+        "from": {
+          "type": "string",
+          "description": "Input variable name for extract/copy steps (must be saved by a previous step)."
+        },
+        "to": {
+          "type": "string",
+          "description": "Output directory (for extract) or output file template (for copy_to_payload). Can contain ${...} placeholders and ${basename}/${filename}."
+        },
+
+        "match": {
+          "$ref": "#/definitions/match",
+          "description": "How to match a file when using find/pick."
+        },
+
+        "save_as": {
+          "type": "string",
+          "description": "Variable name to store the primary output of this step (file or dir)."
+        },
+        "also_save_as": {
+          "type": "string",
+          "description": "Secondary variable name to store a convenient reference (e.g., the copied payload file)."
+        },
+
+        "expect": {
+          "type": "string",
+          "description": "Cardinality expectation when matching.",
+          "enum": ["one", "at_least_one", "any"],
+          "default": "one"
+        },
+        "select": {
+          "type": "string",
+          "description": "How to select when multiple candidates exist.",
+          "enum": ["shortest_path", "lexicographic", "newest_mtime"],
+          "default": "shortest_path"
+        },
+        "optional": {
+          "type": "boolean",
+          "description": "If true, failure in this step does not stop the flow.",
+          "default": false
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "op": { "const": "find" } } },
+          "then": {
+            "required": ["root", "match", "save_as"]
+          }
+        },
+        {
+          "if": { "properties": { "op": { "const": "pick" } } },
+          "then": {
+            "required": ["root", "match", "save_as"]
+          }
+        },
+        {
+          "if": { "properties": { "op": { "const": "extract_tgz" } } },
+          "then": { "required": ["from", "to", "save_as"] }
+        },
+        {
+          "if": { "properties": { "op": { "const": "extract_tar" } } },
+          "then": { "required": ["from", "to", "save_as"] }
+        },
+        {
+          "if": { "properties": { "op": { "const": "extract_if_single_tar" } } },
+          "then": { "required": ["root", "to", "save_as"] }
+        },
+        {
+          "if": { "properties": { "op": { "const": "copy_to_payload" } } },
+          "then": { "required": ["from"] }
+        }
+      ]
+    },
+
+    "match": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "on": {
+          "type": "string",
+          "description": "Whether to apply regex to basename (name) or full relative path (path).",
+          "enum": ["name", "path"],
+          "default": "name"
+        },
+        "exact": {
+          "type": "string",
+          "description": "Exact filename to match."
+        },
+        "regex": {
+          "type": "string",
+          "description": "Regex applied to filename (not full path) unless executor chooses otherwise."
+        },
+        "fallback_regex": {
+          "type": "string",
+          "description": "Fallback regex if exact did not match."
+        }
+      },
+      "anyOf": [
+        { "required": ["exact"] },
+        { "required": ["regex"] }
+      ]
+    },
+
+    "placeholderRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["var", "const", "nas_share"]
+        },
+        "required": {
+          "type": "boolean",
+          "default": false
+        },
+        "default": {
+          "type": "string",
+          "default": ""
+        },
+
+        "path": {
+          "type": "string",
+          "description": "For mode=var: dotted path inside release_pipeline_config.json (after ${...} expansion)."
+        },
+        "value": {
+          "type": "string",
+          "description": "For mode=const: literal text."
+        },
+
+        "run": {
+          "type": "string",
+          "description": "For mode=nas_share: which run's remote_dir to use.",
+          "enum": ["release", "debug"],
+          "default": "release"
+        },
+        "from": {
+          "type": "string",
+          "description": "For mode=nas_share: variable name from prepare.flow steps (preferably the payload file variable)."
+        },
+        "match": {
+          "$ref": "#/definitions/match",
+          "description": "Optional alternative matcher if you don't want to use a variable (advanced)."
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "mode": { "const": "var" } } },
+          "then": { "required": ["path"] }
+        },
+        {
+          "if": { "properties": { "mode": { "const": "const" } } },
+          "then": { "required": ["value"] }
+        },
+        {
+          "if": { "properties": { "mode": { "const": "nas_share" } } },
+          "then": {
+            "anyOf": [
+              { "required": ["from"] },
+              { "required": ["match"] }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}
