@@ -20,6 +20,7 @@ import secrets
 import threading
 import time
 import webbrowser
+import base64
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -245,12 +246,111 @@ def _feishu_oauth_exchange_code_for_user_token(
     raise RuntimeError("Token exchange failed: unknown error")
 
 
-def _feishu_oauth_get_user_access_token_localhost(*, oauth_cfg: Dict[str, Any], timeout_sec: int) -> str:
+def _jwt_exp_ts(token: str) -> int:
+    """Best-effort parse JWT exp (seconds since epoch). Returns 0 if unknown."""
+    t = str(token or "").strip()
+    parts = t.split(".")
+    if len(parts) != 3:
+        return 0
+    payload_b64 = parts[1]
+    # base64url padding
+    pad = "=" * ((4 - len(payload_b64) % 4) % 4)
+    try:
+        raw = base64.urlsafe_b64decode((payload_b64 + pad).encode("utf-8"))
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+        exp = int(data.get("exp") or 0)
+        return exp if exp > 0 else 0
+    except Exception:
+        return 0
+
+
+def _feishu_extract_oauth_token_fields(resp: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize token exchange/refresh response to a common dict."""
+    if isinstance(resp, dict) and isinstance(resp.get("data"), dict):
+        data = resp.get("data") or {}
+    else:
+        data = resp or {}
+
+    access_token = str(data.get("access_token") or data.get("user_access_token") or "").strip()
+    refresh_token = str(data.get("refresh_token") or "").strip()
+    expires_in = data.get("expires_in")
+    refresh_expires_in = data.get("refresh_expires_in")
+    try:
+        expires_in_i = int(expires_in) if expires_in is not None else 0
+    except Exception:
+        expires_in_i = 0
+    try:
+        refresh_expires_in_i = int(refresh_expires_in) if refresh_expires_in is not None else 0
+    except Exception:
+        refresh_expires_in_i = 0
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "expires_in": expires_in_i,
+        "refresh_expires_in": refresh_expires_in_i,
+    }
+
+
+def _feishu_oauth_refresh_user_access_token(*, app_id: str, app_secret: str, refresh_token: str, timeout_sec: int) -> Dict[str, Any]:
+    # Use the same endpoint family as initial exchange.
+    url = "https://open.feishu.cn/open-apis/authen/v2/oauth/token"
+    payload = {
+        "grant_type": "refresh_token",
+        "client_id": app_id,
+        "client_secret": app_secret,
+        "refresh_token": str(refresh_token),
+    }
+    resp = _http_json(method="POST", url=url, headers={}, body=payload, timeout_sec=timeout_sec)
+    # Wrapper: {code,msg,data:{...}}
+    if isinstance(resp, dict) and "code" in resp and "data" in resp:
+        if int(resp.get("code") or 0) != 0:
+            raise RuntimeError(f"Token refresh failed: {resp}")
+    return resp
+
+
+def _feishu_maybe_save_user_oauth_tokens(
+    *,
+    cfg_path: Path,
+    cfg_raw: Dict[str, Any],
+    access_token: str,
+    refresh_token: str,
+    access_expires_at: int,
+    refresh_expires_at: int,
+    enabled: bool,
+) -> None:
+    if not enabled:
+        return
+    if not isinstance(cfg_raw.get("feishu"), dict):
+        cfg_raw["feishu"] = {}
+    fei = cfg_raw["feishu"]  # type: ignore[assignment]
+    if access_token:
+        fei["user_access_token"] = access_token  # type: ignore[index]
+    if refresh_token:
+        fei["user_refresh_token"] = refresh_token  # type: ignore[index]
+    if int(access_expires_at or 0) > 0:
+        fei["user_access_token_expires_at"] = int(access_expires_at)  # type: ignore[index]
+    if int(refresh_expires_at or 0) > 0:
+        fei["user_refresh_token_expires_at"] = int(refresh_expires_at)  # type: ignore[index]
+    fei["user_token_saved_at"] = int(time.time())  # type: ignore[index]
+    cfg_path.write_text(json.dumps(cfg_raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _feishu_oauth_get_user_access_token_localhost(
+    *,
+    oauth_cfg: Dict[str, Any],
+    timeout_sec: int,
+    notify_cfg: Optional[Dict[str, Any]] = None,
+) -> str:
     app_id = str(oauth_cfg.get("app_id") or "").strip()
     app_secret = str(oauth_cfg.get("app_secret") or "").strip()
     redirect_uri = str(oauth_cfg.get("redirect_uri") or "http://localhost:8000/callback").strip()
     scopes = _feishu_oauth_normalize_scopes(str(oauth_cfg.get("scopes") or ""))
     open_browser = bool(oauth_cfg.get("open_browser", True))
+    strict_state = bool(oauth_cfg.get("strict_state", True))
+    # For security, default to binding callback server to loopback.
+    # (The redirect_uri host may be 'localhost', but binding to 0.0.0.0 is unnecessary.)
+    bind_localhost_only = bool(oauth_cfg.get("bind_localhost_only", True))
 
     if not app_id or not app_secret:
         raise RuntimeError("Feishu OAuth enabled but oauth.app_id/app_secret is missing in config")
@@ -265,16 +365,43 @@ def _feishu_oauth_get_user_access_token_localhost(*, oauth_cfg: Dict[str, Any], 
 
     print("Feishu OAuth: open this URL in a browser and authorize:")
     print(auth_url)
+
+    # Optional: push the auth URL to Feishu via the configured webhook.
+    # NOTE: if redirect_uri is localhost, the link must be opened on the same machine
+    # that is running this script (opening on mobile will redirect to mobile localhost).
+    if notify_cfg is not None:
+        try:
+            tips = "(open on the SAME PC running the script)" if (u.hostname in ("localhost", "127.0.0.1") or "localhost" in redirect_uri) else ""
+            _maybe_notify_webhook_text(
+                cfg=notify_cfg,
+                text="Feishu OAuth required\n" + tips + "\n" + auth_url,
+                request_timeout_sec=10,
+            )
+        except Exception:
+            pass
+
     if open_browser:
         try:
             webbrowser.open(auth_url)
         except Exception:
             pass
 
+    bind_host = host
+    if bind_localhost_only and host in ("localhost", "127.0.0.1", "::1"):
+        bind_host = "127.0.0.1"
+
     print(f"Feishu OAuth: waiting for callback on {host}:{port}{callback_path} ...")
-    code, got_state = _feishu_oauth_wait_for_code(host=host, port=port, callback_path=callback_path, timeout_sec=int(oauth_cfg.get("timeout_sec") or timeout_sec))
+    code, got_state = _feishu_oauth_wait_for_code(
+        host=bind_host,
+        port=port,
+        callback_path=callback_path,
+        timeout_sec=int(oauth_cfg.get("timeout_sec") or timeout_sec),
+    )
     if got_state and got_state != state:
-        print("Feishu OAuth WARNING: state mismatch (possible multiple tabs). Proceeding.")
+        msg = "Feishu OAuth: state mismatch (possible multiple tabs or spoofed callback)."
+        if strict_state:
+            raise RuntimeError(msg)
+        print("WARN: " + msg + " Proceeding because strict_state=false.", file=sys.stderr)
 
     token_resp = _feishu_oauth_exchange_code_for_user_token(
         app_id=app_id,
@@ -284,17 +411,118 @@ def _feishu_oauth_get_user_access_token_localhost(*, oauth_cfg: Dict[str, Any], 
         timeout_sec=int(oauth_cfg.get("token_timeout_sec") or timeout_sec),
     )
 
-    # Unwrap wrapper
-    data: Any
-    if isinstance(token_resp, dict) and isinstance(token_resp.get("data"), dict):
-        data = token_resp.get("data") or {}
-    else:
-        data = token_resp
+    fields = _feishu_extract_oauth_token_fields(token_resp if isinstance(token_resp, dict) else {})
 
-    access_token = str((data or {}).get("access_token") or (data or {}).get("user_access_token") or "").strip()
+    access_token = str(fields.get("access_token") or "").strip()
     if not access_token:
         raise RuntimeError(f"Feishu OAuth: token exchange succeeded but access_token missing: {token_resp}")
     return access_token
+
+
+def _feishu_oauth_get_user_tokens_localhost(
+    *,
+    oauth_cfg: Dict[str, Any],
+    timeout_sec: int,
+    notify_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Run interactive OAuth and return token fields (access/refresh/expiry)."""
+
+    app_id = str(oauth_cfg.get("app_id") or "").strip()
+    app_secret = str(oauth_cfg.get("app_secret") or "").strip()
+    redirect_uri = str(oauth_cfg.get("redirect_uri") or "http://localhost:8000/callback").strip()
+    if not app_id or not app_secret:
+        raise RuntimeError("Feishu OAuth enabled but oauth.app_id/app_secret is missing in config")
+
+    # Use the existing function to drive browser + callback + exchange.
+    # Then immediately refresh via refresh_token path if the exchange returned it.
+    # (We cannot access the raw token_resp from the wrapper, so re-run exchange inline here.)
+
+    u = urllib.parse.urlsplit(redirect_uri)
+    host = u.hostname or "localhost"
+    port = int(u.port or 8000)
+    callback_path = u.path or "/callback"
+    scopes = _feishu_oauth_normalize_scopes(str(oauth_cfg.get("scopes") or ""))
+    open_browser = bool(oauth_cfg.get("open_browser", True))
+    strict_state = bool(oauth_cfg.get("strict_state", True))
+    bind_localhost_only = bool(oauth_cfg.get("bind_localhost_only", True))
+
+    state = secrets.token_urlsafe(16)
+    auth_url = _feishu_oauth_build_authorize_url(app_id=app_id, redirect_uri=redirect_uri, state=state, scope=scopes)
+
+    print("Feishu OAuth: open this URL in a browser and authorize:")
+    print(auth_url)
+    if notify_cfg is not None:
+        try:
+            tips = "(open on the SAME PC running the script)" if (u.hostname in ("localhost", "127.0.0.1") or "localhost" in redirect_uri) else ""
+            _maybe_notify_webhook_text(cfg=notify_cfg, text="Feishu OAuth required\n" + tips + "\n" + auth_url, request_timeout_sec=10)
+        except Exception:
+            pass
+
+    if open_browser:
+        try:
+            webbrowser.open(auth_url)
+        except Exception:
+            pass
+
+    bind_host = host
+    if bind_localhost_only and host in ("localhost", "127.0.0.1", "::1"):
+        bind_host = "127.0.0.1"
+
+    print(f"Feishu OAuth: waiting for callback on {host}:{port}{callback_path} ...")
+    code, got_state = _feishu_oauth_wait_for_code(host=bind_host, port=port, callback_path=callback_path, timeout_sec=int(oauth_cfg.get("timeout_sec") or timeout_sec))
+    if got_state and got_state != state:
+        msg = "Feishu OAuth: state mismatch (possible multiple tabs or spoofed callback)."
+        if strict_state:
+            raise RuntimeError(msg)
+        print("WARN: " + msg + " Proceeding because strict_state=false.", file=sys.stderr)
+
+    token_resp = _feishu_oauth_exchange_code_for_user_token(
+        app_id=app_id,
+        app_secret=app_secret,
+        code=code,
+        redirect_uri=redirect_uri,
+        timeout_sec=int(oauth_cfg.get("token_timeout_sec") or timeout_sec),
+    )
+    fields = _feishu_extract_oauth_token_fields(token_resp if isinstance(token_resp, dict) else {})
+    access_token = str(fields.get("access_token") or "").strip()
+    refresh_token = str(fields.get("refresh_token") or "").strip()
+    if not access_token:
+        raise RuntimeError(f"Feishu OAuth: token exchange succeeded but access_token missing: {token_resp}")
+
+    if not refresh_token:
+        # Some Feishu auth flows return short-lived access_token without refresh_token.
+        # Do not print token values; only print structural hints.
+        keys = []
+        try:
+            if isinstance(token_resp, dict):
+                keys = sorted([str(k) for k in token_resp.keys()])
+        except Exception:
+            keys = []
+        data_keys = []
+        try:
+            if isinstance(token_resp, dict) and isinstance(token_resp.get("data"), dict):
+                data_keys = sorted([str(k) for k in (token_resp.get("data") or {}).keys()])
+        except Exception:
+            data_keys = []
+        print(
+            "WARN: Feishu OAuth response did not include refresh_token; "
+            "long-term auto-refresh will not work. "
+            "Check whether the app/tenant supports refresh tokens for this OAuth flow (offline_access). "
+            f"resp_keys={keys} data_keys={data_keys}",
+            file=sys.stderr,
+        )
+
+    now = int(time.time())
+    access_expires_at = now + int(fields.get("expires_in") or 0) if int(fields.get("expires_in") or 0) > 0 else _jwt_exp_ts(access_token)
+    refresh_expires_at = now + int(fields.get("refresh_expires_in") or 0) if int(fields.get("refresh_expires_in") or 0) > 0 else 0
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "access_expires_at": int(access_expires_at or 0),
+        "refresh_expires_at": int(refresh_expires_at or 0),
+        "raw": token_resp,
+    }
 
 
 def _feishu_maybe_save_user_access_token(*, cfg_path: Path, cfg_raw: Dict[str, Any], access_token: str, enabled: bool) -> None:
@@ -306,6 +534,138 @@ def _feishu_maybe_save_user_access_token(*, cfg_path: Path, cfg_raw: Dict[str, A
         cfg_raw["feishu"] = {}
     cfg_raw["feishu"]["user_access_token"] = access_token  # type: ignore[index]
     cfg_path.write_text(json.dumps(cfg_raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _feishu_user_refresh_token_from_cfg(cfg: Dict[str, Any]) -> str:
+    tok = str(cfg.get("user_refresh_token") or "").strip()
+    if tok:
+        return tok
+    env_name = str(cfg.get("user_refresh_token_env") or "FEISHU_USER_REFRESH_TOKEN").strip() or "FEISHU_USER_REFRESH_TOKEN"
+    return (os.environ.get(env_name) or "").strip()
+
+
+def _feishu_user_access_token_expires_at_from_cfg(cfg: Dict[str, Any]) -> int:
+    v = cfg.get("user_access_token_expires_at")
+    try:
+        return int(v) if v is not None else 0
+    except Exception:
+        return 0
+
+
+def _feishu_user_refresh_token_expires_at_from_cfg(cfg: Dict[str, Any]) -> int:
+    v = cfg.get("user_refresh_token_expires_at")
+    try:
+        return int(v) if v is not None else 0
+    except Exception:
+        return 0
+
+
+def _feishu_ensure_fresh_user_access_token(
+    *,
+    cfg_path: Path,
+    cfg_raw: Dict[str, Any],
+    feishu_cfg: Dict[str, Any],
+    feishu_oauth_cfg: Dict[str, Any],
+    timeout_sec: int,
+    auto_save: bool,
+    notify_cfg: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Return a usable user_access_token; refresh automatically when possible."""
+
+    # 1) Existing access token
+    access_token = _feishu_user_token_from_cfg(feishu_cfg)
+    expires_at = _feishu_user_access_token_expires_at_from_cfg(feishu_cfg)
+    if expires_at <= 0 and access_token:
+        # Try JWT exp fallback.
+        expires_at = _jwt_exp_ts(access_token)
+
+    now = int(time.time())
+    # Refresh a bit early.
+    refresh_skew = int(feishu_oauth_cfg.get("refresh_skew_sec") or 300)
+
+    if access_token and (expires_at <= 0 or now < (expires_at - refresh_skew)):
+        return access_token
+
+    # 2) Refresh token path (non-interactive)
+    refresh_token = _feishu_user_refresh_token_from_cfg(feishu_cfg)
+    refresh_exp_at = _feishu_user_refresh_token_expires_at_from_cfg(feishu_cfg)
+    if refresh_token and (refresh_exp_at <= 0 or now < (refresh_exp_at - 60)):
+        app_id = str(feishu_oauth_cfg.get("app_id") or "").strip()
+        app_secret = str(feishu_oauth_cfg.get("app_secret") or "").strip()
+        if app_id and app_secret:
+            try:
+                resp = _feishu_oauth_refresh_user_access_token(
+                    app_id=app_id,
+                    app_secret=app_secret,
+                    refresh_token=refresh_token,
+                    timeout_sec=int(feishu_oauth_cfg.get("token_timeout_sec") or timeout_sec),
+                )
+                fields = _feishu_extract_oauth_token_fields(resp if isinstance(resp, dict) else {})
+                new_access = str(fields.get("access_token") or "").strip()
+                new_refresh = str(fields.get("refresh_token") or refresh_token).strip()
+                if not new_access:
+                    raise RuntimeError(f"refresh succeeded but access_token missing: {resp}")
+
+                new_expires_at = 0
+                if int(fields.get("expires_in") or 0) > 0:
+                    new_expires_at = now + int(fields.get("expires_in") or 0)
+                else:
+                    new_expires_at = _jwt_exp_ts(new_access)
+
+                new_refresh_expires_at = 0
+                if int(fields.get("refresh_expires_in") or 0) > 0:
+                    new_refresh_expires_at = now + int(fields.get("refresh_expires_in") or 0)
+
+                feishu_cfg["user_access_token"] = new_access
+                feishu_cfg["user_refresh_token"] = new_refresh
+                if new_expires_at > 0:
+                    feishu_cfg["user_access_token_expires_at"] = int(new_expires_at)
+                if new_refresh_expires_at > 0:
+                    feishu_cfg["user_refresh_token_expires_at"] = int(new_refresh_expires_at)
+
+                _feishu_maybe_save_user_oauth_tokens(
+                    cfg_path=cfg_path,
+                    cfg_raw=cfg_raw,
+                    access_token=new_access,
+                    refresh_token=new_refresh,
+                    access_expires_at=new_expires_at,
+                    refresh_expires_at=new_refresh_expires_at,
+                    enabled=bool(auto_save),
+                )
+
+                return new_access
+            except Exception as e:
+                print(f"WARN: Feishu OAuth refresh_token refresh failed; will fall back to interactive OAuth if enabled: {e}", file=sys.stderr)
+
+    # 3) Interactive OAuth fallback (only if enabled)
+    if bool(feishu_oauth_cfg.get("enabled", False)):
+        tok = _feishu_oauth_get_user_tokens_localhost(
+            oauth_cfg=feishu_oauth_cfg,
+            timeout_sec=timeout_sec,
+            notify_cfg=notify_cfg,
+        )
+        new_access = str(tok.get("access_token") or "").strip()
+        new_refresh = str(tok.get("refresh_token") or "").strip()
+        feishu_cfg["user_access_token"] = new_access
+        if new_refresh:
+            feishu_cfg["user_refresh_token"] = new_refresh
+        if int(tok.get("access_expires_at") or 0) > 0:
+            feishu_cfg["user_access_token_expires_at"] = int(tok.get("access_expires_at") or 0)
+        if int(tok.get("refresh_expires_at") or 0) > 0:
+            feishu_cfg["user_refresh_token_expires_at"] = int(tok.get("refresh_expires_at") or 0)
+
+        _feishu_maybe_save_user_oauth_tokens(
+            cfg_path=cfg_path,
+            cfg_raw=cfg_raw,
+            access_token=new_access,
+            refresh_token=new_refresh,
+            access_expires_at=int(tok.get("access_expires_at") or 0),
+            refresh_expires_at=int(tok.get("refresh_expires_at") or 0),
+            enabled=bool(auto_save),
+        )
+        return new_access
+
+    return access_token
 
 
 def _feishu_tenant_token_cache_file(*, cfg_path: Path, feishu_cfg: Dict[str, Any]) -> Path:
@@ -3587,12 +3947,32 @@ def main() -> int:
                     )
 
                 print("Feishu pre-auth: starting OAuth now...")
-                new_token = _feishu_oauth_get_user_access_token_localhost(oauth_cfg=feishu_oauth_cfg, timeout_sec=feishu_timeout_sec)
+                tok = _feishu_oauth_get_user_tokens_localhost(
+                    oauth_cfg=feishu_oauth_cfg,
+                    timeout_sec=feishu_timeout_sec,
+                    notify_cfg=cfg,
+                )
+                new_token = str(tok.get("access_token") or "").strip()
+                new_refresh = str(tok.get("refresh_token") or "").strip()
                 feishu_cfg["user_access_token"] = new_token
+                if new_refresh:
+                    feishu_cfg["user_refresh_token"] = new_refresh
+                if int(tok.get("access_expires_at") or 0) > 0:
+                    feishu_cfg["user_access_token_expires_at"] = int(tok.get("access_expires_at") or 0)
+                if int(tok.get("refresh_expires_at") or 0) > 0:
+                    feishu_cfg["user_refresh_token_expires_at"] = int(tok.get("refresh_expires_at") or 0)
 
                 # In preauth-only mode, default to saving the token so later background runs won't block.
                 should_save = bool(feishu_oauth_auto_save) or bool(args.feishu_preauth_only)
-                _feishu_maybe_save_user_access_token(cfg_path=cfg_path, cfg_raw=cfg_raw, access_token=new_token, enabled=should_save)
+                _feishu_maybe_save_user_oauth_tokens(
+                    cfg_path=cfg_path,
+                    cfg_raw=cfg_raw,
+                    access_token=new_token,
+                    refresh_token=new_refresh,
+                    access_expires_at=int(tok.get("access_expires_at") or 0),
+                    refresh_expires_at=int(tok.get("refresh_expires_at") or 0),
+                    enabled=should_save,
+                )
 
                 if should_save:
                     print("Feishu pre-auth: token saved into config")
@@ -4242,7 +4622,11 @@ def main() -> int:
                     "Put a fresh feishu.user_access_token into JSON, or enable feishu.oauth.*."
                 )
             print(f"Feishu: {reason}; starting OAuth to obtain a fresh token...")
-            new_token = _feishu_oauth_get_user_access_token_localhost(oauth_cfg=feishu_oauth_cfg, timeout_sec=feishu_timeout_sec)
+            new_token = _feishu_oauth_get_user_access_token_localhost(
+                oauth_cfg=feishu_oauth_cfg,
+                timeout_sec=feishu_timeout_sec,
+                notify_cfg=cfg,
+            )
             feishu_cfg["user_access_token"] = new_token
             _feishu_maybe_save_user_access_token(cfg_path=cfg_path, cfg_raw=cfg_raw, access_token=new_token, enabled=feishu_oauth_auto_save)
             return new_token

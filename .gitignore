@@ -165,6 +165,7 @@ venv.bak/
 # Local config files that may contain credentials (keep *.example.json)
 release_pipeline_config*.json
 !release_pipeline_config.example.json
+!release_pipeline_config.template.json
 nas_upload_config.json
 nas_upload_config.json.tmp
 

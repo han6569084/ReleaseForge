@@ -12,7 +12,7 @@
     "timeout_sec": 600,
     "auth": {
       "type": "basic",
-      "username": "REDACTED",
+      "username": "<JENKINS_USER>",
       "password": "${JENKINS_PASSWORD}"
     },
     "triggers": {
@@ -90,7 +90,7 @@
       "verify_tls": false,
       "timeout_sec": 1800,
       "auth": {
-        "username": "REDACTED",
+        "username": "<NAS_USER>",
         "password": "${NAS_WEBDAV_PASSWORD}"
       }
     },
@@ -98,7 +98,7 @@
       "base_url": "https://10.2.100.85:5001",
       "verify_tls": false,
       "auth": {
-        "username": "REDACTED",
+        "username": "<NAS_USER>",
         "password": "${NAS_DSM_PASSWORD}"
       }
     },
@@ -141,7 +141,7 @@
   "notifications": {
     "webhook": {
       "enabled": true,
-      "url": "https://www.feishu.cn/flow/api/trigger-webhook/13ee8ab31ef6f1c22d062aa69424cfed",
+      "url": "https://www.feishu.cn/flow/api/trigger-webhook/xxxxx",
       "verify_tls": true,
       "timeout_sec": 10,
       "on_success": true,
@@ -168,7 +168,7 @@
     "docx_replace_placeholders": true,
     "docx_replace_only": true,
     "print_placeholder_mapping": true,
-    "user_access_token": "eyJhbGciOiJFUzI1NiIsImZlYXR1cmVfY29kZSI6IkZlYXR1cmVPQXV0aEpXVFNpZ25fQ04iLCJraWQiOiI3NTg3MjA3NTMxMjQwNDEwMDU3IiwidHlwIjoiSldUIn0.eyJqdGkiOiI3NTg4NDI1NjkxNTkxMzk2MjgyIiwiaWF0IjoxNzY2ODE4MDM4LCJleHAiOjE3NjY4MjUyMzgsInZlciI6InYxIiwidHlwIjoiYWNjZXNzX3Rva2VuIiwiY2xpZW50X2lkIjoiY2xpX2E2YjIxODA0YjUyYjUwMGIiLCJzY29wZSI6ImF1dGg6dXNlci5pZDpyZWFkIGRvY3g6ZG9jdW1lbnQgd2lraTpub2RlOmNvcHkgd2lraTpub2RlOnJlYWQgd2lraTp3aWtpIHdpa2k6d2lraTpyZWFkb25seSIsImF1dGhfaWQiOiI3NTg4NDI1Njc3NjMyNzAzNjk1IiwiYXV0aF90aW1lIjoxNzY2ODE4MDM0LCJhdXRoX2V4cCI6MTc5ODM1NDAzNCwidW5pdCI6ImV1X25jIiwidGVuYW50X3VuaXQiOiJldV9uYyIsIm9wYXF1ZSI6dHJ1ZSwiZW5jIjoiQWlRa0FRRUNBTUlEQUFFQkF3QUNBUTBBQXdzTEFBQUFBd0FBQUFkR1pXRjBkWEpsQUFBQUVHOWhkWFJvWDI5d1lYRjFaVjlxZDNRQUFBQUlWR1Z1WVc1MFNXUUFBQUFCTUFBQUFBUlVhVzFsQUFBQUNqRTNOall6TmpFMk1EQVBBQVFNQUFBQUFRb0FBV0xGSWxtdmdBQWlDd0FDQUFBQURQTEFZMFpLY0tTdmpGUTJmQXNBQXdBQUFEQkdIRjlGRkxicmk3SkpnaDRHYXhoMTFtaEVhN2JNNFpoOTdYR0V3ZjhMVDdUVU9NdlVJTXZnbDdLd2VJL2MwMEFBQ3dBRkFBQUFCV1YxWDI1akFHMEZUd1VBbGloOGhUM2orTTJFVHkyZG8vcURweCttNTdOc3BMZjhxcit5dEcwQjNsdEhBY2tlN2tWdEZVRVhVWlUwbXBKNVN4Vm5hQUl5WndnSEoxRHEvN0orNzVPcUZLaGY4VmN5L0duTE9GU1Q1RDB3dTM1SC81azNFWjBqTWo0eVJrcDU3bjYwc2RISGIwaVhtTWtLZ1V5aS90SG1GN0U3NnpLbkphT3VhMVpKdE1ZYmEyY051M1JueUVXT2dxY3JmQT09IiwiZW5jX3ZlciI6InYxIn0.zJzQpy1zYCzLIEp5FjkqZie7f5B4V87ql0YCf7DlUsOeVyCwMIrurfgthQCndZoxm0__pfh5wopwrSzORvxsxg",
+    "user_access_token": "${FEISHU_USER_ACCESS_TOKEN}",
     "user_access_token_env": "FEISHU_USER_ACCESS_TOKEN",
     "user_refresh_token": "",
     "user_refresh_token_env": "FEISHU_USER_REFRESH_TOKEN",
@@ -176,8 +176,8 @@
     "user_refresh_token_expires_at": 0,
     "oauth": {
       "enabled": true,
-      "app_id": "cli_a6b21804b52b500b",
-      "app_secret": "03QDxSBmkr3CexYkZyDsAEFdfq1itLUh",
+      "app_id": "<FEISHU_APP_ID>",
+      "app_secret": "${FEISHU_APP_SECRET}",
       "redirect_uri": "http://localhost:8000/callback",
       "scopes": "wiki:wiki wiki:node:read wiki:node:copy docx:document drive:drive docs:document:copy docs:document:read docs:document:write offline_access",
       "open_browser": true,
@@ -187,12 +187,12 @@
       "auto_save_user_access_token": true,
       "auto_oauth_on_99991677": true
     },
-    "template_node_token": "WxDvwNErQilq4GkYC4hctB1Kndd",
+    "template_node_token": "",
     "template_page_id": "",
     "target_space_id": "7314490024274378754",
     "target_parent_token": "",
-    "template_file_token": "https://zepp.feishu.cn/docx/OS8jdJlizofcfoxVnGpcwWhUnrd",
-    "docx_target_folder_token": "https://zepp.feishu.cn/drive/folder/IVTMfaylGlQZLodrAjCcOGhQnEe",
+    "template_file_token": "",
+    "docx_target_folder_token": "",
     "docx_allow_create_fallback": true,
     "docx_domain": "",
     "admin_email": "",
