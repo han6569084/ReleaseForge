@@ -1,10 +1,10 @@
 {
   "release": {
-    "project": "pamir_64m",
-    "device_name": "pamir_64m",
-    "stage": "beta4",
-    "version": "3.6.0.3",
-    "variant": "pamir_64m beta4 v3.6.0.3",
+    "project": "cologne",
+    "device_name": "cologne",
+    "stage": "beta1",
+    "version": "2.0.11.1",
+    "variant": "cologne beta1 v2.0.11.1",
     "notes": ""
   },
   "jenkins": {
@@ -15,9 +15,41 @@
       "username": "hanzhijian",
       "password": "Asdfghjkl;'@6902"
     },
+    "triggers": {
+      "job_url": "https://jenkins.huami.com/job/firmware_auto_trigger/job/HuamiOS_HS3",
+      "auto_run_pipeline": true,
+      "pipeline_args": [],
+      "release": {
+        "parameters": {
+          "PRODUCT": "cologne",
+          "TAG_NAME": "cologne-beta5",
+          "BOOT_TAG_NAME": "cologne-bootloader-1.3.0",
+          "RECOVERY_TAG_NAME": "cologne-recovery-1.3.0",
+          "FCT_TAG_NAME": "cologne-fct-1.4.0",
+          "BUILD_MODE": "OTA,OTA_SLEEP,FCT,BOOT,RECOVERY",
+          "BUILD_TEST_TOOL": "是",
+          "VERSION_NAME": "2.0.9",
+          "FCT_VERSION_NAME": "1.4.0",
+          "BUILD_RELEASE": "release"
+        }
+      },
+      "debug": {
+        "parameters": {
+          "PRODUCT": "cologne",
+          "TAG_NAME": "cologne-beta5",
+          "BOOT_TAG_NAME": "cologne-bootloader-1.3.0",
+          "RECOVERY_TAG_NAME": "cologne-recovery-1.3.0",
+          "FCT_TAG_NAME": "cologne-fct-1.4.0",
+          "BUILD_MODE": "OTA,BOOT,RECOVERY",
+          "VERSION_NAME": "2.0.10",
+          "FCT_VERSION_NAME": "1.4.0",
+          "BUILD_RELEASE": "debug"
+        }
+      }
+    },
     "builds": {
       "debug": {
-        "build_url": "https://jenkins.huami.com/job/firmware_auto_trigger/job/HuamiOS_HS3/4015/",
+        "build_url": "https://jenkins.huami.com/job/firmware_auto_trigger/job/HuamiOS_HS3/4153/",
         "download": {
           "mode": "artifacts",
           "include_globs": [
@@ -31,7 +63,7 @@
         }
       },
       "release": {
-        "build_url": "https://jenkins.huami.com/job/firmware_auto_trigger/job/HuamiOS_HS3/4014/",
+        "build_url": "https://jenkins.huami.com/job/firmware_auto_trigger/job/HuamiOS_HS3/4152/",
         "download": {
           "mode": "artifacts",
           "include_globs": [
@@ -71,7 +103,7 @@
       }
     },
     "remote": {
-      "base_dir": "/GT智能手表事业部/软件部/软件版本文档/hzj-test/Cologne",
+      "base_dir": "/GT智能手表事业部/软件部/软件版本文档/Cologne/ASAN固件",
       "folder_name": "${release.variant}",
       "path_strategy": "base_plus_folder"
     },
@@ -106,33 +138,61 @@
     "output_dir": "",
     "filename_template": "{project}_{version}_{timestamp}_版本文档.md"
   },
+  "notifications": {
+    "webhook": {
+      "enabled": true,
+      "url": "https://www.feishu.cn/flow/api/trigger-webhook/13ee8ab31ef6f1c22d062aa69424cfed",
+      "verify_tls": true,
+      "timeout_sec": 10,
+      "on_success": true,
+      "on_failure": true,
+      "on_progress": true,
+      "print_response": false,
+      "payload_by_event": {
+        "download_start": {
+          "text": "开始下载(${runtime.extra.run_name})\nBuild: ${runtime.extra.build_url}\nOut: ${runtime.extra.out_dir}"
+        },
+        "failed": {
+          "text": "${release.device_name} ${release.stage} ${release.version} 流程失败\n原因: ${runtime.message}\n耗时: ${runtime.duration_sec}s\nRelease: ${jenkins.builds.release.build_url}\nDebug: ${jenkins.builds.debug.build_url}\nFeishu: ${runtime.extra.feishu_url}"
+        }
+      },
+      "payload": {
+        "text": "${release.device_name} ${release.stage} ${release.version} 打包完成\n耗时: ${runtime.duration_sec}s\nRelease: ${jenkins.builds.release.build_url}\nDebug: ${jenkins.builds.debug.build_url}\nFeishu: ${runtime.extra.feishu_url}"
+      }
+    }
+  },
   "feishu": {
     "enabled": true,
     "use_wiki": true,
-    "wiki_copy_only": false,
+    "wiki_copy_only": true,
     "docx_replace_placeholders": true,
     "docx_replace_only": true,
     "print_placeholder_mapping": true,
-    "user_access_token": "eyJhbGciOiJFUzI1NiIsImZlYXR1cmVfY29kZSI6IkZlYXR1cmVPQXV0aEpXVFNpZ25fQ04iLCJraWQiOiI3NTg1MzUyMDg2MzA1NDU5NDAwIiwidHlwIjoiSldUIn0.eyJqdGkiOiI3NTg2NTk0MTM5NjQzMzY2MzY4IiwiaWF0IjoxNzY2MzkxNTk2LCJleHAiOjE3NjYzOTg3OTYsInZlciI6InYxIiwidHlwIjoiYWNjZXNzX3Rva2VuIiwiY2xpZW50X2lkIjoiY2xpX2E2YjIxODA0YjUyYjUwMGIiLCJzY29wZSI6ImF1dGg6dXNlci5pZDpyZWFkIGRvY3g6ZG9jdW1lbnQgd2lraTpub2RlOmNvcHkgd2lraTpub2RlOnJlYWQgd2lraTp3aWtpIHdpa2k6d2lraTpyZWFkb25seSIsImF1dGhfaWQiOiI3NTg2NTk0MTI3NDMzODEzMTk3IiwiYXV0aF90aW1lIjoxNzY2MzkxNTkzLCJhdXRoX2V4cCI6MTc5NzkyNzU5MywidW5pdCI6ImV1X25jIiwidGVuYW50X3VuaXQiOiJldV9uYyIsIm9wYXF1ZSI6dHJ1ZSwiZW5jIjoiQWlRa0FRRUNBTUlEQUFFQkF3QUNBUTBBQXdzTEFBQUFBd0FBQUFkR1pXRjBkWEpsQUFBQUVHOWhkWFJvWDI5d1lYRjFaVjlxZDNRQUFBQUlWR1Z1WVc1MFNXUUFBQUFCTUFBQUFBUlVhVzFsQUFBQUNqRTNOall6TmpFMk1EQVBBQVFNQUFBQUFRb0FBV0xGSWxtdmdBQWlDd0FDQUFBQURQTEFZMFpLY0tTdmpGUTJmQXNBQXdBQUFEQkdIRjlGRkxicmk3SkpnaDRHYXhoMTFtaEVhN2JNNFpoOTdYR0V3ZjhMVDdUVU9NdlVJTXZnbDdLd2VJL2MwMEFBQ3dBRkFBQUFCV1YxWDI1akFEcnlFbjgxVWNXRXBYYXVrWmc2Rkhxcy81c2hFVjUrc3RzdTBMcVE3WXoyVHlJam4vZHN2V3NVR3QwRnVsRFY1VlQyYVVlMHkzc2lOK0NKMGJvb0JqdDJmKytsK3gwbCtwU2FHU0RJaVpudWFZVVVuN3hZcGlseHZSeFJmUkdOSDJjN0hnR09PdERPelNNeVBtNXB2cXdLeVFPaS8yVkswNGVjdTFlNFBXQWFBRmRzR1hpZHFPRktQOEtubFp4aFA0Y2I4Zz09IiwiZW5jX3ZlciI6InYxIn0.v4Uhb4k8QTvHQr9_1KhIawkPoji3x62hoZ2HzkIZP1bOvGXGs3WafAspicCIRV9Fdc62Q3GCajIuaZhoQuBqSA",
+    "user_access_token": "eyJhbGciOiJFUzI1NiIsImZlYXR1cmVfY29kZSI6IkZlYXR1cmVPQXV0aEpXVFNpZ25fQ04iLCJraWQiOiI3NTg3MjA3NTMxMjQwNDEwMDU3IiwidHlwIjoiSldUIn0.eyJqdGkiOiI3NTg4NDE2Nzc5MjE5NzAwOTMwIiwiaWF0IjoxNzY2ODE1OTYzLCJleHAiOjE3NjY4MjMxNjMsInZlciI6InYxIiwidHlwIjoiYWNjZXNzX3Rva2VuIiwiY2xpZW50X2lkIjoiY2xpX2E2YjIxODA0YjUyYjUwMGIiLCJzY29wZSI6ImF1dGg6dXNlci5pZDpyZWFkIGRvY3g6ZG9jdW1lbnQgd2lraTpub2RlOmNvcHkgd2lraTpub2RlOnJlYWQgd2lraTp3aWtpIHdpa2k6d2lraTpyZWFkb25seSIsImF1dGhfaWQiOiI3NTg4NDE2NzQ2NjgwMjczODgxIiwiYXV0aF90aW1lIjoxNzY2ODE1OTU1LCJhdXRoX2V4cCI6MTc5ODM1MTk1NSwidW5pdCI6ImV1X25jIiwidGVuYW50X3VuaXQiOiJldV9uYyIsIm9wYXF1ZSI6dHJ1ZSwiZW5jIjoiQWlRa0FRRUNBTUlEQUFFQkF3QUNBUTBBQXdzTEFBQUFBd0FBQUFkR1pXRjBkWEpsQUFBQUVHOWhkWFJvWDI5d1lYRjFaVjlxZDNRQUFBQUlWR1Z1WVc1MFNXUUFBQUFCTUFBQUFBUlVhVzFsQUFBQUNqRTNOall6TmpFMk1EQVBBQVFNQUFBQUFRb0FBV0xGSWxtdmdBQWlDd0FDQUFBQURQTEFZMFpLY0tTdmpGUTJmQXNBQXdBQUFEQkdIRjlGRkxicmk3SkpnaDRHYXhoMTFtaEVhN2JNNFpoOTdYR0V3ZjhMVDdUVU9NdlVJTXZnbDdLd2VJL2MwMEFBQ3dBRkFBQUFCV1YxWDI1akFEOTZmUXNQcGVzT0VUOU1DL2xESmhUQWM0TGNyTXhHYTNnWEFRZ3l2WXVXcXZYNG9nZEZZaldsY1hOZGxVTFBxTjFDckZRakh1OTJEU01sazdvdnh1cC9YZ1dyTkVJYWFKSStoc1B4RDJ6dnZxUFpwWms0ekNTQ2R5WVFzMFNZeTJhVVNiN2pZS1JETitiQnlZckIvenRxUzZsYjJGYnhyeC9nV3ZDZkhVV3FVbDhEeVErdm5WbWpMSTBkb0E0Q0YrUVN3dz09IiwiZW5jX3ZlciI6InYxIn0.Rt09NXyu8gRSbj1UN0qchDSc4pARh_PyneH_bbbZ2nV-lk8RNt0pC02qu8o6Mk5wyG2ve-5oMj_4oIHejK0bPQ",
     "user_access_token_env": "FEISHU_USER_ACCESS_TOKEN",
     "oauth": {
       "enabled": true,
       "app_id": "cli_a6b21804b52b500b",
       "app_secret": "03QDxSBmkr3CexYkZyDsAEFdfq1itLUh",
       "redirect_uri": "http://localhost:8000/callback",
-      "scopes": "wiki:wiki wiki:node:read wiki:node:copy docx:document",
+      "scopes": "wiki:wiki wiki:node:read wiki:node:copy docx:document drive:drive docs:document:copy docs:document:read docs:document:write",
       "open_browser": true,
       "timeout_sec": 300,
       "token_timeout_sec": 30,
       "auto_save_user_access_token": true,
       "auto_oauth_on_99991677": true
     },
-    "template_node_token": "E4NRwVTmkigYl0kjStJcu7eYnAb",
+    "template_node_token": "WxDvwNErQilq4GkYC4hctB1Kndd",
     "template_page_id": "",
     "target_space_id": "7314490024274378754",
     "target_parent_token": "",
-    "template_file_token": "",
-    "target_folder_token": "",
+    "template_file_token": "https://zepp.feishu.cn/docx/OS8jdJlizofcfoxVnGpcwWhUnrd",
+    "docx_target_folder_token": "https://zepp.feishu.cn/drive/folder/IVTMfaylGlQZLodrAjCcOGhQnEe",
+    "docx_allow_create_fallback": true,
+    "docx_domain": "",
+    "admin_email": "",
+    "share_admin_perm": "full_access",
+    "share_file_type": "docx",
     "name_template": "{{REL_DEVICE_NAME}} {{REL_STAGE}} {{REL_VERSION}}",
     "placeholder_overrides": {
       "{{REL_BOOTLOADER_MANIFEST_INFO}}": "",

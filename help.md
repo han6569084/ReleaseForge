@@ -183,7 +183,33 @@ python .\release_pipeline_run.py --config .\release_pipeline_config.json --only 
 - `target_space_id` / `target_parent_token`：复制目标位置
 - `name_template`：页面标题模板（支持占位符 `{{REL_*}}`）
 
-- token 与 OAuth：
+- Docx 模板模式（不走 Wiki）：
+  - `use_wiki=false`
+  - `template_file_token`：Docx 模板（支持两种写法）
+    - 直接填 docx token（document_id）
+    - 或填完整 URL，例如 `https://zepp.feishu.cn/docx/<token>`（脚本会自动提取 token，并复用该域名生成新文档链接）
+  - `docx_domain`（可选）：生成文档链接的域名（例如 `zepp.feishu.cn`）。不填则优先使用模板 URL 的域名。
+  - `docx_replace_placeholders`：是否在复制/创建后的 Docx 里做占位符替换
+  - `docx_replace_only`：只做占位符替换，不进行“Markdown 转 blocks + 插入”（避免依赖 `docx:document.block:convert` 应用权限）
+  - `docx_insert_markdown`（可选，默认 true）：是否把生成的版本文档 Markdown 插入到 Docx（为 false 时不会调用 blocks/convert）
+  - `admin_email`（可选，默认 `hanzhijian@zepp.com`）：创建后自动把该邮箱加入协作者并授予 `full_access`（管理员）
+    - `share_admin_perm`：默认 `full_access`
+    - `share_file_type`：建议 `docx`（用于 drive 权限接口的 `type` 参数）
+
+- token 获取策略（默认优先使用“应用/tenant token”，避免每次手动授权）：
+  - `token_mode`：可选 `tenant` / `user` / `auto`
+    - `tenant`（默认）：使用 `tenant_access_token`（应用身份），可通过 `app_id/app_secret` 自动获取并本地缓存
+    - `user`：使用 `user_access_token`（用户身份），支持 localhost OAuth
+    - `auto`：优先 tenant，取不到再走 user/OAuth
+
+- tenant token（应用身份，推荐）：
+  - `tenant_access_token`：直接填写（不推荐长期放在配置里）
+  - `tenant_access_token_env`：从环境变量读取（例如 `FEISHU_TENANT_ACCESS_TOKEN`）
+  - `tenant_access_token_cache`：是否开启本地缓存（默认 `true`）
+  - `tenant_access_token_cache_file`：缓存文件路径（默认落在配置同目录的 `.feishu_tenant_access_token.json`）
+  - `app.app_id / app.app_secret`：用于自动获取 tenant token（也可复用 `oauth.app_id/app_secret`）
+
+- user token（用户身份，兼容/兜底）：
   - `user_access_token`：直接填写 token（不推荐长期使用）
   - `user_access_token_env`：从环境变量读取（推荐，例如 `FEISHU_USER_ACCESS_TOKEN`）
   - `oauth.enabled=true`：启用 localhost OAuth，遇到 token 过期/权限不足可自动重新授权
@@ -192,6 +218,8 @@ python .\release_pipeline_run.py --config .\release_pipeline_config.json --only 
 - `print_placeholder_mapping`：是否输出最终 mapping JSON（便于排查）
 
 > 安全建议：不要把真实的 Jenkins/NAS/Feishu 密钥提交到仓库；优先通过环境变量或私有配置文件管理。
+
+> 注意：使用 tenant token 想“彻底跳过每次授权”，前提是飞书应用已被管理员在租户内完成安装/授权（应用权限已审批通过），并且模板/目标目录对应用身份可访问（例如在云文档/知识库里给应用开放权限）。
 
 ---
 
@@ -325,7 +353,8 @@ Debug 的主目录本身会整目录上传到 NAS 的 `Monkey/` 下；如果上�
 ### 7.1 Jenkins 下载失败
 
 - 检查 `jenkins.builds.*.build_url` 是否可在浏览器打开
-- 检查 `jenkins.auth.username/password`
+- 检查 `jenkins.auth.username/password`（更推荐使用 Jenkins API Token）
+- 推荐做法：设置环境变量 `JENKINS_USER` + `JENKINS_API_TOKEN`，并在配置里写 `jenkins.auth.password_env=JENKINS_API_TOKEN`
 - 需要代理/证书问题时，优先确认系统网络与公司证书策略
 
 ### 7.2 DSM 分享链接失败
@@ -333,6 +362,12 @@ Debug 的主目录本身会整目录上传到 NAS 的 `Monkey/` 下；如果上�
 - 检查 `nas.dsm.base_url`（通常 `https://<ip>:5001`）
 - 自签证书环境：`nas.dsm.verify_tls=false`
 - 检查 DSM 账号权限（FileStation API 需要对应权限）
+
+### 7.2.1 NAS WebDAV 上传 401
+
+- 401 通常表示 WebDAV 账号/密码不对，或账号没有目标路径权限
+- 推荐用环境变量提供密码：`NAS_WEBDAV_PASSWORD`（配置里写 `nas.webdav.auth.password_env=NAS_WEBDAV_PASSWORD`）
+- 如果配置里还是 `"password": "<REDACTED>"`，上传会必然失败（会把 `<REDACTED>` 当成真实密码去请求）
 
 ### 7.3 飞书报错 99991677 / 99991679
 
@@ -504,6 +539,113 @@ python .\feishu_oauth_get_user_token.py --no-browser --app-id "<cli_xxx>" --app-
 - 报 99991679：说明应用权限或用户授权 scope 不够；确认开放平台权限已开通，并用 `--scopes` 请求所需 scope 后重新授权。
 - token 很快失效：属于正常现象；建议启用主脚本里的 `feishu.oauth.enabled=true` 让其在必要时自动重新 OAuth。
 
+### 8.3 jenkins_trigger_build.py 使用方法（触发 Jenkins 构建并写回 build_url）
+
+用途：根据配置发起 Jenkins 参数化构建（先触发 `release`，然后立刻触发 `debug`，不等待 release 完成），并监测两次构建直到都结束且 `SUCCESS` 后，把 build 号对应的 `build_url` 直接写回到你的配置文件中：
+
+- `jenkins.builds.release.build_url`
+- `jenkins.builds.debug.build_url`
+
+> 说明：如果 JSON 中没有指定某个参数 key，该参数不会提交给 Jenkins，从而使用 Jenkins Job 的默认值。
+
+另外：如果配置里启用了 `notifications.webhook`，脚本会：
+
+- Jenkins build 号一出来就发送：`Jenkins <release|debug> started: #<id> <url>`
+- 任意一个先结束就先发送：`Jenkins <release|debug> finished: #<id> result=<...> <url>`（不会等另一个结束）
+
+WebHook 发送格式固定为：
+
+```json
+{ "text": "..." }
+```
+
+#### 配置示例（最小）
+
+在你的主配置里增加 `jenkins.triggers`：
+
+```json
+{
+  "jenkins": {
+    "base_url": "https://jenkins.huami.com",
+    "auth": {
+      "type": "basic",
+      "username": "<your-username>",
+      "password": "<your-password>"
+    },
+    "triggers": {
+      "job_url": "https://jenkins.huami.com/job/firmware_auto_trigger/job/HuamiOS_HS3/",
+      "release": {
+        "parameters": {
+          "PRODUCT": "matterhorn",
+          "TAG_NAME": "your_tag",
+          "BOOT_TAG_NAME": "boot_tag",
+          "RECOVERY_TAG_NAME": "recovery_tag",
+          "FCT_TAG_NAME": "fct_tag"
+        }
+      },
+      "debug": {
+        "parameters": {
+          "PRODUCT": "matterhorn",
+          "TAG_NAME": "your_tag"
+        }
+      }
+    }
+  }
+}
+```
+
+#### 运行示例（PowerShell）
+
+1) 真实触发并写回配置（默认会生成 `.bak.<timestamp>` 备份）：
+
+```powershell
+python .\jenkins_trigger_build.py --config .\release_pipeline_config.json
+```
+
+2) 干跑：只打印会提交哪些参数，不触发构建：
+
+```powershell
+python .\jenkins_trigger_build.py --config .\release_pipeline_config.json --dry-run
+```
+
+3) 调整超时/轮询：
+
+```powershell
+python .\jenkins_trigger_build.py --config .\release_pipeline_config.json `
+  --poll-interval-sec 5 --queue-timeout-sec 1200 --build-timeout-sec 10800
+```
+
+4) Jenkins 构建完成后自动执行发版主流程（下载/上传/文档/飞书）：
+
+```powershell
+python .\jenkins_trigger_build.py --config .\release_pipeline_config.json --run-pipeline
+```
+
+你也可以在配置里开启自动执行，这样就算你忘了加 `--run-pipeline` 也会在构建成功后自动启动主流程：
+
+```json
+{
+  "jenkins": {
+    "triggers": {
+      "auto_run_pipeline": true,
+      "pipeline_args": []
+    }
+  }
+}
+```
+
+如果你需要给主流程额外参数（例如跳过飞书、跳过上传等），用 `--pipeline-args` 透传：
+
+```powershell
+python .\jenkins_trigger_build.py --config .\release_pipeline_config.json --run-pipeline `
+  --pipeline-args=--skip-feishu --pipeline-args=--skip-upload --pipeline-args=--skip-share
+```
+
+#### 常见问题
+
+- 触发成功但报“Location header for queue item missing”：说明 Jenkins 或代理吞掉了响应头 `Location`，脚本 v1 无法从 queue 反查 build number；需要你们调整代理透传响应头，或后续我再加“时间窗口 + 参数匹配”的 fallback。
+- 报 403：可能是 CSRF(crumb) 或权限不足；脚本会自动探测 crumb（`/crumbIssuer/api/json`），如果你们禁用了该接口需要放开或手工关闭 CSRF。
+
 ---
 
 ## 9. 占位符参考（示例）
@@ -511,6 +653,9 @@ python .\feishu_oauth_get_user_token.py --no-browser --app-id "<cli_xxx>" --app-
 占位符会在飞书 Docx 替换阶段使用（或输出 mapping 文件供人工替换），常见示例：
 
 - `{{REL_DEVICE_NAME}}` / `{{REL_STAGE}}` / `{{REL_VERSION}}`
+- `{{REL_APP_TAG}}` / `{{REL_BOOT_TAG}}` / `{{REL_RECOVERY_TAG}}` / `{{REL_FCT_TAG}}`
+
+> 提示：即使你使用 `prepare.mode=placeholders_dsl`，以上 4 个 TAG 占位符也会从 `jenkins.triggers.release.parameters` 自动注入到映射里用于飞书替换。
 - `{{REL_RELEASE_FULL_ARCHIVE}}`
 - `{{REL_RELEASE_OTA_CLOUD_ARCHIVE}}`
 - `{{REL_RELEASE_OTA_SIGN_ZIP}}`
@@ -518,3 +663,44 @@ python .\feishu_oauth_get_user_token.py --no-browser --app-id "<cli_xxx>" --app-
 - `{{REL_RELEASE_OTA_SLEEP_ARCHIVE}}`（可选）
 - `{{REL_MONKEY_FULL_ARCHIVE}}`（可选）
 - `{{REL_BUILD_LOG_FILE}}`（可选：Jenkins consoleText 下载并上传后得到）
+
+---
+
+## 10. WebHook 通知（打包完成提醒）
+
+你可以在流水线完成后自动发送一条 WebHook 消息（例如飞书群机器人）。配置在 `notifications.webhook`：
+
+- `enabled`：是否启用
+- `url`：WebHook 地址
+- `verify_tls`：HTTPS 证书校验（内网自签可设为 false）
+- `timeout_sec`：请求超时
+- `on_success` / `on_failure`：成功/失败是否通知
+- `on_success`：正常完成时发送（包括 Feishu copy-only / replace-only 这类提前结束）
+- `on_failure`：失败退出时发送（包括 `SystemExit`/参数缺失/权限错误等导致的非 0 退出，以及未捕获异常）
+- `on_progress`：进度通知（例如开始下载）是否发送
+- `payload_by_event`：按事件覆盖 payload（例如 `download_start`）
+- `payload`：要 POST 的 JSON（支持 `${...}` 占位符）
+
+`payload` 中可用的 runtime 变量：
+
+- `${runtime.status}`：`success`/`failed`
+- `${runtime.message}`：简短描述
+- `${runtime.duration_sec}`：耗时秒数
+- `${runtime.config_path}`：配置文件路径
+- `${runtime.extra.feishu_url}`：生成的飞书文档/Wiki 链接（未生成则为空字符串）
+
+示例（飞书 Flow WebHook，要求格式：`{"text":"..."}`）：
+
+```json
+{
+  "notifications": {
+    "webhook": {
+      "enabled": true,
+      "url": "https://www.feishu.cn/flow/api/trigger-webhook/REPLACE_ME",
+      "payload": {
+        "text": "${release.device_name} ${release.stage} ${release.version} 打包完成\n耗时: ${runtime.duration_sec}s"
+      }
+    }
+  }
+}
+```

@@ -13,6 +13,25 @@ from typing import Iterable, Optional, Tuple
 from urllib.parse import quote
 
 
+class CurlHttpError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        method: str,
+        url: str,
+        http_code: Optional[int] = None,
+        returncode: Optional[int] = None,
+        stderr: str = "",
+    ):
+        super().__init__(message)
+        self.method = method
+        self.url = url
+        self.http_code = http_code
+        self.returncode = returncode
+        self.stderr = stderr
+
+
 def _curl_bin() -> str:
     return "curl.exe" if os.name == "nt" else "curl"
 
@@ -172,8 +191,13 @@ class WebDavClient:
         )
         if proc.returncode != 0:
             stderr = (proc.stderr or b"").decode("utf-8", errors="replace")
-            raise RuntimeError(
-                f"curl {method} failed: rc={proc.returncode} url={url} stderr={stderr.strip()[:800]}"
+            raise CurlHttpError(
+                f"curl {method} failed: rc={proc.returncode} url={url}",
+                method=method,
+                url=url,
+                http_code=None,
+                returncode=proc.returncode,
+                stderr=stderr.strip()[:800],
             )
         http_code_text = (proc.stdout or b"").decode("utf-8", errors="replace").strip()
         try:
@@ -185,7 +209,14 @@ class WebDavClient:
             return
 
         stderr = (proc.stderr or b"").decode("utf-8", errors="replace")
-        raise RuntimeError(f"curl {method} failed: status={http_code} url={url} stderr={stderr.strip()[:800]}")
+        raise CurlHttpError(
+            f"curl {method} failed: status={http_code} url={url}",
+            method=method,
+            url=url,
+            http_code=http_code,
+            returncode=proc.returncode,
+            stderr=stderr.strip()[:800],
+        )
 
     def mkcol(self, remote_dir_path: str) -> None:
         # remote_dir_path must end with '/'
@@ -250,6 +281,11 @@ def main() -> int:
     parser.add_argument("--config", required=True, help="Path to JSON config")
     parser.add_argument("--dry-run", action="store_true", help="Print actions without uploading")
     parser.add_argument("--progress", action="store_true", help="Show curl progress (speed/ETA) for uploads")
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip file upload if server reports conflict/already exists",
+    )
     args = parser.parse_args()
 
     cfg = load_config(Path(args.config))
@@ -295,8 +331,14 @@ def main() -> int:
             print("No files to upload.")
             return 0
 
+        seen_remote_files: set[str] = set()
+
         for idx, (abs_path, rel_posix) in enumerate(files, start=1):
             remote_file = remote_target_dir.rstrip("/") + "/" + rel_posix
+            if remote_file in seen_remote_files:
+                print(f"[skip] duplicate in same run: {rel_posix} -> {remote_file}")
+                continue
+            seen_remote_files.add(remote_file)
             remote_parent = os.path.dirname(remote_file)
             if not remote_parent.endswith("/"):
                 remote_parent += "/"
@@ -309,7 +351,17 @@ def main() -> int:
             if remote_parent not in ensured_dirs:
                 client.ensure_dir_tree(remote_parent)
                 ensured_dirs.add(remote_parent)
-            client.put_file(remote_file, abs_path)
+
+            try:
+                client.put_file(remote_file, abs_path)
+            except CurlHttpError as e:
+                # NOTE: some servers return 403 for overwrite attempts even when
+                # the user has write permission; treat it as a conflict when
+                # --skip-existing is enabled.
+                if args.skip_existing and e.http_code in (403, 405, 409, 412):
+                    print(f"[skip-existing] {rel_posix} -> {remote_file} (status={e.http_code})")
+                    continue
+                raise
 
     print("Upload complete.")
     return 0

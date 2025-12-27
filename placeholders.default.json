@@ -68,13 +68,6 @@
           "save_as": "ota_sleep_tgz",
           "optional": true
         },
-        {
-          "op": "copy_to_payload",
-          "name": "upload OTA_SLEEP tgz (if present)",
-          "from": "ota_sleep_tgz",
-          "also_save_as": "ota_sleep_payload",
-          "optional": true
-        },
 
         {
           "op": "extract_tgz",
@@ -85,7 +78,6 @@
         },
         {
           "op": "extract_if_single_tar",
-          "name": "extract optional tar layer inside cloud",
           "root": "cloud_dir",
           "to": "${prepare.flow.work_dir}/cloud_tar",
           "save_as": "cloud_content_dir"
@@ -227,14 +219,6 @@
           "match": { "regex": "^archive_${release.project}[A-Za-z0-9_-]*_.*\\.tgz$" },
           "save_as": "debug_full_archive_tgz",
           "optional": true
-        },
-        {
-          "op": "copy_to_payload",
-          "name": "upload debug full archive tgz (OTA整包)",
-          "run": "debug",
-          "from": "debug_full_archive_tgz",
-          "also_save_as": "debug_full_archive_payload",
-          "optional": true
         }
       ]
     }
@@ -242,7 +226,7 @@
 
   "placeholders": {
     "strategy": {
-      "nas_share_priority": ["local_dsm_create_share_link", "run_summary_share_links"],
+      "nas_share_priority": ["run_summary_share_links"],
       "missing_placeholder": "keep"
     },
 
@@ -251,18 +235,25 @@
       "{{REL_STAGE}}": { "mode": "var", "path": "release.stage" },
       "{{REL_VERSION}}": { "mode": "var", "path": "release.version", "required": true },
 
+      "{{REL_APP_TAG}}": { "mode": "var", "path": "jenkins.triggers.release.parameters.TAG_NAME" },
+      "{{REL_BOOT_TAG}}": { "mode": "var", "path": "jenkins.triggers.release.parameters.BOOT_TAG_NAME" },
+      "{{REL_RECOVERY_TAG}}": { "mode": "var", "path": "jenkins.triggers.release.parameters.RECOVERY_TAG_NAME" },
+      "{{REL_FCT_TAG}}": { "mode": "var", "path": "jenkins.triggers.release.parameters.FCT_TAG_NAME" },
+
       "{{REL_CI_BUILD_URL}}": { "mode": "var", "path": "jenkins.builds.release.build_url" },
 
       "{{REL_BOOTLOADER_MANIFEST_INFO}}": {
         "mode": "nas_share",
         "run": "release",
         "from": "boot_manifest_payload",
+        "match": { "regex": "^manifest_BOOT_.*\\.xml$" },
         "required": true
       },
       "{{REL_RECOVERY_MANIFEST_INFO}}": {
         "mode": "nas_share",
         "run": "release",
         "from": "recovery_manifest_payload",
+        "match": { "regex": "^manifest_RECOVERY_.*\\.xml$" },
         "required": true
       },
 
@@ -283,31 +274,34 @@
         "mode": "nas_share",
         "run": "release",
         "from": "ota_cloud_payload",
+        "match": { "regex": "^archive_OTA_CLOUD_.*\\.tgz$" },
         "required": true
       },
       "{{REL_RELEASE_OTA_SLEEP_ARCHIVE}}": {
         "mode": "nas_share",
         "run": "release",
-        "from": "ota_sleep_payload",
+        "from": "ota_sleep_tgz",
+        "match": { "regex": "^archive_OTA_SLEEP_.*\\.tgz$" },
         "required": false
       },
       "{{REL_RELEASE_OTA_SIGN_ZIP}}": {
         "mode": "nas_share",
         "run": "release",
         "from": "ota_sign_payload",
+        "match": { "exact": "watch@mhs003_ota_sign.zip", "fallback_regex": ".*_ota_sign\\.zip$" },
         "required": true
       },
       "{{REL_RELEASE_FACTORY_TOOL_ZIP}}": {
         "mode": "nas_share",
         "run": "release",
-        "match": { "regex": ".*factory.*\\.zip$" },
-        "required": true
+        "match": { "regex": ".*factory.*\\.zip$" }
       },
 
       "{{REL_MONKEY_FULL_ARCHIVE}}": {
         "mode": "nas_share",
         "run": "debug",
-        "from": "debug_full_archive_payload",
+        "from": "debug_full_archive_tgz",
+        "match": { "regex": "^archive_${release.project}[A-Za-z0-9_-]*_.*\\.tgz$" },
         "required": false
       },
 
@@ -321,6 +315,7 @@
         "mode": "nas_share",
         "run": "release",
         "from": "release_console_log_payload",
+        "match": { "exact": "jenkins_release_console.log", "fallback_regex": "^jenkins_release_console\\.log$" },
         "required": false
       }
     }

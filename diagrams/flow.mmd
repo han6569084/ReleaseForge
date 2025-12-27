@@ -1,0 +1,17 @@
+flowchart TD;
+  A[开始] --> B[触发 Jenkins Release + Debug];
+  B --> C[轮询 queue -> build number];
+  C --> D[轮询 build -> SUCCESS/FAIL];
+  D -->|任一失败| X[失败退出];
+  D -->|全部 SUCCESS| E[写回 build_url 到 config];
+  E --> F[启动 release_pipeline_run.py];
+  F --> G1[Download: artifacts / consoleText];
+  G1 --> G2[Prepare: 解包/重组/生成 upload_payload];
+  G2 --> G3[Upload: WebDAV 上传];
+  G3 --> G4[Share: DSM 生成共享链接];
+  G4 --> G5[Doc: 本地版本文档];
+  G5 --> G6[Feishu: 复制模板 + 占位符替换 + 插入内容];
+  G1 --> N1[通知: download_start];
+  X --> N2[通知: failed];
+  G6 --> N3[通知: completed - Feishu URL];
+  N3 --> Z[结束];

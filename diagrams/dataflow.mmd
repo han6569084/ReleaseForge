@@ -1,0 +1,37 @@
+flowchart LR
+  subgraph Sources[数据源]
+    JArtifacts[Jenkins Artifacts]
+    JConsole[Jenkins consoleText]
+    Meta["release.* 元信息<br/>+ Jenkins triggers params"]
+  end
+
+  subgraph Local[本地工作区]
+    DL[work/download/*]
+    Prep[work/prepare/*]
+    Payload["upload_payload<br/>(最终上传结构)"]
+    Mapping[placeholder_mapping.json]
+    DocMD[版本文档.md]
+  end
+
+  subgraph Remote[远端]
+    NASDir[NAS WebDAV 目录]
+    ShareLink[DSM Share Link]
+    FeiWiki[Feishu Wiki Node]
+    FeiDocx[Feishu Docx Document]
+  end
+
+  JArtifacts --> DL
+  JConsole --> DL
+  Meta --> Prep
+
+  DL --> Prep --> Payload
+  Payload --> NASDir
+  NASDir --> ShareLink
+
+  Payload --> Mapping
+  Meta --> Mapping
+  ShareLink --> Mapping
+
+  Mapping --> FeiDocx
+  DocMD --> FeiDocx
+  FeiDocx --> FeiWiki

@@ -63,6 +63,51 @@ def _http_json(
         raise RuntimeError(f"Non-JSON response calling {url}: {e}; body={snippet!r}")
 
 
+def _get_webhook_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    notif = cfg.get("notifications")
+    if not isinstance(notif, dict):
+        return {}
+    wh = notif.get("webhook")
+    if not isinstance(wh, dict):
+        return {}
+    return wh
+
+
+def _http_post_json(*, url: str, payload: Dict[str, Any], timeout_sec: int, verify_tls: bool) -> Tuple[int, str]:
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, method="POST", data=data)
+    req.add_header("Content-Type", "application/json; charset=utf-8")
+
+    ctx = None
+    if url.lower().startswith("https://") and not verify_tls:
+        ctx = ssl._create_unverified_context()
+
+    with urllib.request.urlopen(req, timeout=int(timeout_sec), context=ctx) as resp:
+        raw = resp.read() or b""
+        text = raw.decode("utf-8", errors="replace")
+        return int(getattr(resp, "status", resp.getcode())), text[:2000]
+
+
+def _maybe_notify_webhook_text(*, cfg: Dict[str, Any], text: str, request_timeout_sec: int) -> None:
+    wh = _get_webhook_cfg(cfg)
+    if not bool(wh.get("enabled", False)):
+        return
+
+    url = str(wh.get("url") or "").strip()
+    if not url:
+        return
+
+    verify_tls = bool(wh.get("verify_tls", True))
+    timeout_sec = int(wh.get("timeout_sec", request_timeout_sec or 10))
+    payload = {"text": str(text)}
+
+    try:
+        code, _resp = _http_post_json(url=url, payload=payload, timeout_sec=timeout_sec, verify_tls=verify_tls)
+        print(f"WebHook notified: HTTP {code}")
+    except Exception as e:
+        print(f"WARN: failed to notify webhook: {e}", file=sys.stderr)
+
+
 def _feishu_user_token_from_cfg(cfg: Dict[str, Any]) -> str:
     tok = str(cfg.get("user_access_token") or "").strip()
     if tok:
@@ -263,6 +308,435 @@ def _feishu_maybe_save_user_access_token(*, cfg_path: Path, cfg_raw: Dict[str, A
     cfg_path.write_text(json.dumps(cfg_raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _feishu_tenant_token_cache_file(*, cfg_path: Path, feishu_cfg: Dict[str, Any]) -> Path:
+    p = str(feishu_cfg.get("tenant_access_token_cache_file") or "").strip()
+    if p:
+        pp = Path(p).expanduser()
+        if not pp.is_absolute():
+            pp = (cfg_path.parent / pp)
+        return pp.resolve()
+    return (cfg_path.parent / ".feishu_tenant_access_token.json").resolve()
+
+
+def _feishu_try_load_cached_tenant_token(*, cache_file: Path) -> Tuple[str, int]:
+    try:
+        if not cache_file.exists():
+            return "", 0
+        raw = json.loads(cache_file.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return "", 0
+        token = str(raw.get("tenant_access_token") or raw.get("access_token") or "").strip()
+        expires_at = int(raw.get("expires_at") or 0)
+        if not token or not expires_at:
+            return "", 0
+        if int(time.time()) >= (expires_at - 60):
+            return "", 0
+        return token, expires_at
+    except Exception:
+        return "", 0
+
+
+def _feishu_save_cached_tenant_token(*, cache_file: Path, tenant_access_token: str, expires_at: int) -> None:
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "tenant_access_token": str(tenant_access_token),
+        "expires_at": int(expires_at),
+        "saved_at": int(time.time()),
+    }
+    cache_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _feishu_get_tenant_access_token_internal(*, app_id: str, app_secret: str, timeout_sec: int) -> Tuple[str, int]:
+    if not app_id or not app_secret:
+        raise RuntimeError("Missing app_id/app_secret for tenant_access_token")
+    url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+    resp = _http_json(
+        method="POST",
+        url=url,
+        headers={},
+        body={"app_id": app_id, "app_secret": app_secret},
+        timeout_sec=timeout_sec,
+    )
+    if int(resp.get("code") or 0) != 0:
+        raise RuntimeError(f"Feishu tenant_access_token failed: {resp}")
+    token = str(resp.get("tenant_access_token") or "").strip()
+    expire = int(resp.get("expire") or 0)
+    if not token or not expire:
+        raise RuntimeError(f"Feishu tenant_access_token missing fields: {resp}")
+    expires_at = int(time.time()) + int(expire)
+    return token, expires_at
+
+
+def _feishu_get_tenant_access_token_cached(*, cfg_path: Path, feishu_cfg: Dict[str, Any], timeout_sec: int) -> str:
+    oauth_cfg = (feishu_cfg.get("oauth") or {}) if isinstance(feishu_cfg.get("oauth"), dict) else {}
+    app_id = str(oauth_cfg.get("app_id") or "").strip()
+    app_secret = str(oauth_cfg.get("app_secret") or "").strip()
+    cache_file = _feishu_tenant_token_cache_file(cfg_path=cfg_path, feishu_cfg=feishu_cfg)
+    tok, _exp = _feishu_try_load_cached_tenant_token(cache_file=cache_file)
+    if tok:
+        return tok
+    token, expires_at = _feishu_get_tenant_access_token_internal(app_id=app_id, app_secret=app_secret, timeout_sec=timeout_sec)
+    _feishu_save_cached_tenant_token(cache_file=cache_file, tenant_access_token=token, expires_at=expires_at)
+    return token
+
+
+def _feishu_extract_docx_token(*, value: str) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    if s.startswith("http://") or s.startswith("https://"):
+        # https://<domain>/docx/<token>
+        m = re.search(r"/docx/([A-Za-z0-9]+)", s)
+        if m:
+            return m.group(1)
+    return s
+
+
+def _feishu_extract_drive_folder_token(*, value: str) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    if s.startswith("http://") or s.startswith("https://"):
+        # https://<domain>/drive/folder/<token>
+        m = re.search(r"/drive/folder/([A-Za-z0-9]+)", s)
+        if m:
+            return m.group(1)
+    return s
+
+
+def _feishu_docx_copy_template_best_effort(
+    *,
+    user_access_token: str,
+    template_document_id: str,
+    name: str,
+    target_folder_token: str,
+    timeout_sec: int,
+) -> Optional[Tuple[str, str]]:
+    """Try to copy a Docx template via Docx API (best-effort).
+
+    Some tenants allow omitting folder_token to copy into app space.
+    Returns (new_document_id, url) or None if unsupported/failed.
+    """
+    doc_id = str(template_document_id or "").strip()
+    if not doc_id:
+        return None
+    url = f"https://open.feishu.cn/open-apis/docx/v1/documents/{quote(doc_id)}/copy"
+    payload: Dict[str, Any] = {"title": str(name or "").strip()}
+    folder = str(target_folder_token or "").strip()
+    if folder:
+        payload["folder_token"] = folder
+    try:
+        resp = _http_json(
+            method="POST",
+            url=url,
+            headers={"Authorization": f"Bearer {user_access_token}"},
+            body=payload,
+            timeout_sec=timeout_sec,
+        )
+    except Exception as e:
+        print(f"WARN: Feishu Docx copy (docx API) failed: {e}", file=sys.stderr)
+        return None
+    if int(resp.get("code") or 0) != 0:
+        print(f"WARN: Feishu Docx copy (docx API) returned error: {resp}", file=sys.stderr)
+        return None
+    data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+    doc = data.get("document") if isinstance(data.get("document"), dict) else data
+    new_id = str(doc.get("document_id") or doc.get("id") or data.get("document_id") or "").strip()
+    link = str(doc.get("url") or doc.get("link") or data.get("url") or data.get("link") or "").strip()
+    if not new_id:
+        return None
+    return new_id, link
+
+
+def _feishu_drive_add_permission_member_by_email(
+    *,
+    user_access_token: str,
+    file_token: str,
+    file_type: str,
+    email: str,
+    perm: str,
+    timeout_sec: int,
+) -> Dict[str, Any]:
+    url = f"https://open.feishu.cn/open-apis/drive/v1/permissions/{quote(str(file_token))}/members?type={urllib.parse.quote(str(file_type))}"
+    perm2 = str(perm)
+    # Some tenants/APIs accept only view/edit for files; normalize common alias.
+    if perm2 == "full_access":
+        perm2 = "edit"
+    payload = {
+        "member_type": "email",
+        "member_id": str(email),
+        "perm": perm2,
+    }
+    return _http_json(
+        method="POST",
+        url=url,
+        headers={"Authorization": f"Bearer {user_access_token}"},
+        body=payload,
+        timeout_sec=timeout_sec,
+    )
+
+
+def _feishu_drive_add_permission_member_by_id(
+    *,
+    user_access_token: str,
+    file_token: str,
+    file_type: str,
+    member_type: str,
+    member_id: str,
+    perm: str,
+    timeout_sec: int,
+) -> Dict[str, Any]:
+    url = f"https://open.feishu.cn/open-apis/drive/v1/permissions/{quote(str(file_token))}/members?type={urllib.parse.quote(str(file_type))}"
+    perm2 = str(perm)
+    if perm2 == "full_access":
+        perm2 = "edit"
+    payload = {
+        "member_type": str(member_type),
+        "member_id": str(member_id),
+        "perm": perm2,
+    }
+    return _http_json(
+        method="POST",
+        url=url,
+        headers={"Authorization": f"Bearer {user_access_token}"},
+        body=payload,
+        timeout_sec=timeout_sec,
+    )
+
+
+def _feishu_contact_get_open_id_by_email(*, user_access_token: str, email: str, timeout_sec: int) -> str:
+    """Resolve an email to open_id (user_id) for permission APIs.
+
+    Many Feishu permission endpoints are most reliable with member_type=open_id/openid.
+    """
+
+    email2 = str(email or "").strip()
+    if not email2:
+        return ""
+
+    url = "https://open.feishu.cn/open-apis/contact/v3/users/batch_get_id?user_id_type=open_id"
+    body = {"emails": [email2]}
+    resp = _http_json(
+        method="POST",
+        url=url,
+        headers={"Authorization": f"Bearer {user_access_token}"},
+        body=body,
+        timeout_sec=timeout_sec,
+    )
+    if not isinstance(resp, dict) or int(resp.get("code") or 0) != 0:
+        return ""
+    data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+    users = data.get("user_list") if isinstance(data.get("user_list"), list) else []
+    for u in users:
+        if not isinstance(u, dict):
+            continue
+        if str(u.get("email") or "").strip().lower() == email2.lower():
+            return str(u.get("user_id") or "").strip()
+    return ""
+
+
+def _feishu_drive_meta_batch_query_best_effort(
+    *,
+    user_access_token: str,
+    token: str,
+    timeout_sec: int,
+    with_url: bool,
+) -> Optional[Dict[str, Any]]:
+    """Best-effort resolve Drive meta for a token.
+
+    The Drive permission-member API requires a correct `type` query parameter.
+    Tenants may expect `doc`, `docx`, or `file` for the same token.
+    """
+
+    url = "https://open.feishu.cn/open-apis/drive/v1/metas/batch_query"
+    token2 = str(token or "").strip()
+    if not token2:
+        return None
+
+    # Try common doc types for docx templates.
+    for doc_type in ("docx", "doc", "file"):
+        body = {
+            "request_docs": [{"doc_token": token2, "doc_type": doc_type}],
+            "with_url": bool(with_url),
+        }
+        try:
+            resp = _http_json(
+                method="POST",
+                url=url,
+                headers={"Authorization": f"Bearer {user_access_token}"},
+                body=body,
+                timeout_sec=timeout_sec,
+            )
+        except Exception:
+            continue
+
+        if not isinstance(resp, dict) or int(resp.get("code") or 0) != 0:
+            continue
+        data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+        metas = data.get("metas") if isinstance(data.get("metas"), list) else []
+        if metas and isinstance(metas[0], dict):
+            meta = metas[0]
+            meta["_input_doc_type"] = doc_type
+            return meta
+
+    return None
+
+
+def _feishu_drive_resolve_url_best_effort(*, user_access_token: str, token: str, timeout_sec: int) -> str:
+    meta = _feishu_drive_meta_batch_query_best_effort(
+        user_access_token=user_access_token,
+        token=token,
+        timeout_sec=timeout_sec,
+        with_url=True,
+    )
+    if not isinstance(meta, dict):
+        return ""
+    return str(meta.get("url") or "").strip()
+
+
+def _feishu_drive_add_permission_member_by_email_best_effort(
+    *,
+    user_access_token: str,
+    file_token: str,
+    preferred_file_type: str,
+    email: str,
+    perm: str,
+    timeout_sec: int,
+) -> Dict[str, Any]:
+    """Add permission member and auto-fix mismatched file_type.
+
+    We try, in order:
+    - preferred_file_type (from config)
+    - inferred type from drive metas/batch_query (docx/doc/file)
+    - fallbacks: docx/doc/file
+    """
+
+    token2 = str(file_token or "").strip()
+    if not token2:
+        raise RuntimeError("Missing file_token")
+
+    preferred = str(preferred_file_type or "").strip()
+    candidates: List[str] = []
+    if preferred:
+        candidates.append(preferred)
+
+    meta = _feishu_drive_meta_batch_query_best_effort(
+        user_access_token=user_access_token,
+        token=token2,
+        timeout_sec=timeout_sec,
+        with_url=False,
+    )
+    inferred = str((meta or {}).get("_input_doc_type") or "").strip()
+    if inferred:
+        candidates.append(inferred)
+
+    # Known safe fallbacks for docx-ish resources.
+    candidates.extend(["docx", "doc", "file"])
+
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for t in candidates:
+        tt = str(t or "").strip()
+        if not tt or tt in seen:
+            continue
+        seen.add(tt)
+        ordered.append(tt)
+
+    last_resp: Optional[Dict[str, Any]] = None
+    last_exc: Optional[Exception] = None
+    for t in ordered:
+        try:
+            resp = _feishu_drive_add_permission_member_by_email(
+                user_access_token=user_access_token,
+                file_token=token2,
+                file_type=t,
+                email=email,
+                perm=perm,
+                timeout_sec=timeout_sec,
+            )
+            last_resp = resp
+            if int(resp.get("code") or 0) == 0:
+                return resp
+        except Exception as e:
+            last_exc = e
+            continue
+
+    if last_resp is not None:
+        return last_resp
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Feishu add permission member failed")
+
+
+def _feishu_drive_add_permission_member_best_effort(
+    *,
+    user_access_token: str,
+    file_token: str,
+    preferred_file_type: str,
+    member_type: str,
+    member_id: str,
+    perm: str,
+    timeout_sec: int,
+) -> Dict[str, Any]:
+    """Same as _feishu_drive_add_permission_member_by_email_best_effort but supports open_id."""
+
+    token2 = str(file_token or "").strip()
+    if not token2:
+        raise RuntimeError("Missing file_token")
+
+    preferred = str(preferred_file_type or "").strip()
+    candidates: List[str] = []
+    if preferred:
+        candidates.append(preferred)
+
+    meta = _feishu_drive_meta_batch_query_best_effort(
+        user_access_token=user_access_token,
+        token=token2,
+        timeout_sec=timeout_sec,
+        with_url=False,
+    )
+    inferred = str((meta or {}).get("_input_doc_type") or "").strip()
+    if inferred:
+        candidates.append(inferred)
+    candidates.extend(["docx", "doc", "file"])
+
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for t in candidates:
+        tt = str(t or "").strip()
+        if not tt or tt in seen:
+            continue
+        seen.add(tt)
+        ordered.append(tt)
+
+    last_resp: Optional[Dict[str, Any]] = None
+    last_exc: Optional[Exception] = None
+    for t in ordered:
+        try:
+            resp = _feishu_drive_add_permission_member_by_id(
+                user_access_token=user_access_token,
+                file_token=token2,
+                file_type=t,
+                member_type=member_type,
+                member_id=member_id,
+                perm=perm,
+                timeout_sec=timeout_sec,
+            )
+            last_resp = resp
+            if int(resp.get("code") or 0) == 0:
+                return resp
+        except Exception as e:
+            last_exc = e
+            continue
+
+    if last_resp is not None:
+        return last_resp
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Feishu add permission member failed")
+
+
 def _feishu_copy_template_docx(
     *,
     user_access_token: str,
@@ -272,11 +746,12 @@ def _feishu_copy_template_docx(
     timeout_sec: int,
 ) -> Tuple[str, str]:
     url = f"https://open.feishu.cn/open-apis/drive/v1/files/{template_file_token}/copy"
-    payload = {
-        "folder_token": target_folder_token,
+    payload: Dict[str, Any] = {
         "name": name,
         "type": "docx",
     }
+    if str(target_folder_token or "").strip():
+        payload["folder_token"] = str(target_folder_token).strip()
     resp = _http_json(
         method="POST",
         url=url,
@@ -293,6 +768,72 @@ def _feishu_copy_template_docx(
     if not token:
         raise RuntimeError(f"Feishu copy missing token: {resp}")
     return token, link
+
+
+def _feishu_create_docx_best_effort(*, user_access_token: str, title: str, folder_token: str, timeout_sec: int) -> Tuple[str, str]:
+    """Create a Docx using app/tenant token.
+
+    Mirrors the approach in feishu_app_create_doc_and_share.py: omit folder_token to land in app space.
+    Returns (doc_token/document_id, url).
+    """
+
+    title2 = str(title or "").strip() or "Untitled"
+    folder2 = str(folder_token or "").strip()
+
+    attempts: List[Tuple[str, Dict[str, Any]]] = [
+        (
+            "https://open.feishu.cn/open-apis/docx/v1/documents",
+            {"title": title2, "folder_token": folder2} if folder2 else {"title": title2},
+        ),
+        (
+            "https://open.feishu.cn/open-apis/drive/v1/files/create",
+            {
+                "type": "docx",
+                "file_type": "docx",
+                "title": title2,
+                "name": title2,
+                "folder_token": folder2,
+            },
+        ),
+    ]
+
+    last_resp: Optional[Dict[str, Any]] = None
+    for url, payload in attempts:
+        resp = _http_json(
+            method="POST",
+            url=url,
+            headers={"Authorization": f"Bearer {user_access_token}"},
+            body=payload,
+            timeout_sec=timeout_sec,
+        )
+        last_resp = resp
+        if isinstance(resp, dict) and "code" in resp and int(resp.get("code") or 0) != 0:
+            continue
+        data = resp.get("data") if isinstance(resp, dict) and isinstance(resp.get("data"), dict) else resp
+        if not isinstance(data, dict):
+            continue
+
+        token = str(
+            data.get("token")
+            or (data.get("document") or {}).get("document_id")
+            or (data.get("file") or {}).get("token")
+            or (data.get("file") or {}).get("file_token")
+            or data.get("document_id")
+            or data.get("file_token")
+            or ""
+        ).strip()
+        link = str(
+            data.get("url")
+            or data.get("link")
+            or (data.get("document") or {}).get("url")
+            or (data.get("file") or {}).get("url")
+            or ""
+        ).strip()
+
+        if token:
+            return token, link
+
+    raise RuntimeError(f"Feishu create docx failed: {last_resp}")
 
 
 def _feishu_convert_markdown_to_blocks(
@@ -436,6 +977,321 @@ def _feishu_docx_list_all_blocks(
         if not page_token:
             break
     return items
+
+
+def _feishu_docx_document_has_any_content(
+    *,
+    user_access_token: str,
+    document_id: str,
+    timeout_sec: int,
+) -> bool:
+    blocks = _feishu_docx_list_all_blocks(
+        user_access_token=user_access_token,
+        document_id=document_id,
+        timeout_sec=timeout_sec,
+    )
+    # Best-effort: a doc normally has a single root/page block when empty.
+    return len(blocks) > 1
+
+
+def _feishu_docx_find_root_page_block_id_best_effort(
+    *,
+    user_access_token: str,
+    document_id: str,
+    timeout_sec: int,
+) -> str:
+    """Return a block_id that supports descendant insertion.
+
+    In Feishu Docx APIs, `document_id` is not always a valid `block_id` for
+    descendant creation. Typically the root `page` block should be used.
+    """
+
+    doc_id = str(document_id or "").strip()
+    if not doc_id:
+        return ""
+
+    blocks = _feishu_docx_list_all_blocks(
+        user_access_token=user_access_token,
+        document_id=doc_id,
+        timeout_sec=timeout_sec,
+    )
+    if not blocks:
+        return doc_id
+
+    # Prefer a top-level page block.
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        if str(b.get("block_type") or "").strip().lower() != "page":
+            continue
+        parent = str(b.get("parent_id") or b.get("parent_block_id") or "").strip()
+        if not parent:
+            bid = str(b.get("block_id") or "").strip()
+            if bid:
+                return bid
+
+    # Fallback: any page block.
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        if str(b.get("block_type") or "").strip().lower() == "page":
+            bid = str(b.get("block_id") or "").strip()
+            if bid:
+                return bid
+
+    # Final fallback: first block.
+    bid0 = str(blocks[0].get("block_id") or "").strip() if isinstance(blocks[0], dict) else ""
+    return bid0 or doc_id
+
+
+def _feishu_docx_build_descendant_payload_from_template_blocks(
+    *,
+    template_blocks: List[Dict[str, Any]],
+    template_document_id: str,
+) -> Dict[str, Any]:
+    if not template_blocks:
+        raise RuntimeError("Template docx has no blocks; cannot clone content")
+
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for b in template_blocks:
+        if isinstance(b, dict) and b.get("block_id"):
+            by_id[str(b["block_id"])] = b
+
+    root_old_id = ""
+    if template_document_id and template_document_id in by_id:
+        root_old_id = template_document_id
+    else:
+        for b in template_blocks:
+            if not isinstance(b, dict):
+                continue
+            if str(b.get("block_type") or "") == "page" and not (b.get("parent_id") or b.get("parent_block_id")):
+                root_old_id = str(b.get("block_id") or "").strip()
+                break
+    if not root_old_id:
+        root_old_id = str(template_blocks[0].get("block_id") or "").strip()
+
+    def _children_ids(block: Dict[str, Any]) -> List[str]:
+        for key in ("children", "children_id", "children_ids", "childrenIds"):
+            v = block.get(key)
+            if isinstance(v, list):
+                return [str(x) for x in v if x]
+        return []
+
+    first_level_old = _children_ids(by_id.get(root_old_id, {}) if root_old_id in by_id else {})
+    if not first_level_old:
+        # Fallback: infer from parent_id ordering.
+        for b in template_blocks:
+            if not isinstance(b, dict):
+                continue
+            pid = str(b.get("parent_id") or b.get("parent_block_id") or "").strip()
+            if pid == root_old_id and b.get("block_id"):
+                first_level_old.append(str(b["block_id"]))
+
+    # Map all non-root block ids to temporary ids.
+    id_map: Dict[str, str] = {}
+    for old_id in by_id.keys():
+        if old_id == root_old_id:
+            continue
+        # Feishu accepts temporary ids; use hex to keep it compact.
+        id_map[old_id] = secrets.token_hex(12)
+
+    # Build descendants by reusing list-block items, removing fields that are
+    # known to be server-generated.
+    descendants: List[Dict[str, Any]] = []
+    remove_keys = {
+        "parent_id",
+        "parent_block_id",
+        "document_id",
+        "document_revision_id",
+        "revision_id",
+        "create_time",
+        "update_time",
+        "is_delete",
+    }
+
+    for b in template_blocks:
+        if not isinstance(b, dict) or not b.get("block_id"):
+            continue
+        old_id = str(b["block_id"])
+        if old_id == root_old_id:
+            continue
+        if old_id not in id_map:
+            continue
+        clone = json.loads(json.dumps(b, ensure_ascii=False))
+        clone["block_id"] = id_map[old_id]
+        for k in list(clone.keys()):
+            if k in remove_keys:
+                clone.pop(k, None)
+
+        # Remap children ids.
+        for key in ("children", "children_id", "children_ids", "childrenIds"):
+            if isinstance(clone.get(key), list):
+                clone[key] = [id_map.get(str(x), str(x)) for x in clone[key] if x]
+
+        descendants.append(clone)
+
+    children_id = [id_map.get(x, x) for x in first_level_old if x in id_map]
+    return {"children_id": children_id, "descendants": descendants}
+
+
+def _feishu_docx_clone_template_content_into_document_best_effort(
+    *,
+    user_access_token: str,
+    template_document_id: str,
+    target_document_id: str,
+    target_parent_block_id: str,
+    index: int,
+    timeout_sec: int,
+) -> None:
+    template_blocks = _feishu_docx_list_all_blocks(
+        user_access_token=user_access_token,
+        document_id=template_document_id,
+        timeout_sec=timeout_sec,
+    )
+    payload = _feishu_docx_build_descendant_payload_from_template_blocks(
+        template_blocks=template_blocks,
+        template_document_id=template_document_id,
+    )
+    if not payload.get("descendants"):
+        raise RuntimeError("Template docx appears to have no cloneable descendants")
+
+    try:
+        _ = _feishu_insert_blocks_descendant(
+            user_access_token=user_access_token,
+            document_id=target_document_id,
+            parent_block_id=target_parent_block_id,
+            descendant_payload=payload,
+            index=index,
+            timeout_sec=timeout_sec,
+        )
+        return
+    except RuntimeError as e:
+        msg = str(e)
+        if "1770029" not in msg and "block not support to create" not in msg.lower():
+            raise
+
+    # Retry: insert only first-level children and their descendant subtree.
+    # Build parent map from template_blocks
+    parent_map: Dict[str, str] = {}
+    for b in template_blocks:
+        if not isinstance(b, dict) or not b.get("block_id"):
+            continue
+        bid = str(b.get("block_id") or "")
+        pid = str(b.get("parent_id") or b.get("parent_block_id") or "").strip()
+        parent_map[bid] = pid
+
+    # Determine the root_old_id and first_level_old as in build function
+    # Recompute using helper logic to be robust.
+    root_old_id = ""
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for b in template_blocks:
+        if isinstance(b, dict) and b.get("block_id"):
+            by_id[str(b["block_id"])]=b
+    if template_document_id and template_document_id in by_id:
+        root_old_id = template_document_id
+    else:
+        for b in template_blocks:
+            if not isinstance(b, dict):
+                continue
+            if str(b.get("block_type") or "").lower() == "page" and not (b.get("parent_id") or b.get("parent_block_id")):
+                root_old_id = str(b.get("block_id") or "").strip()
+                break
+    if not root_old_id and template_blocks:
+        root_old_id = str(template_blocks[0].get("block_id") or "").strip()
+
+    first_level_old: List[str] = []
+    def _children_ids_of(old_id: str) -> List[str]:
+        for key in ("children", "children_id", "children_ids", "childrenIds"):
+            v = (by_id.get(old_id) or {}).get(key)
+            if isinstance(v, list):
+                return [str(x) for x in v if x]
+        # fallback: scan parent_map
+        out: List[str] = []
+        for k, p in parent_map.items():
+            if p == old_id:
+                out.append(k)
+        return out
+
+    first_level_old = _children_ids_of(root_old_id)
+    if not first_level_old:
+        # fallback: infer
+        for b in template_blocks:
+            if not isinstance(b, dict):
+                continue
+            pid = str(b.get("parent_id") or b.get("parent_block_id") or "").strip()
+            if pid == root_old_id and b.get("block_id"):
+                first_level_old.append(str(b["block_id"]))
+
+    # Build allowed set: first level + all their descendants
+    allowed: set = set()
+    stack: List[str] = [x for x in first_level_old]
+    while stack:
+        cur = stack.pop()
+        if not cur or cur in allowed:
+            continue
+        allowed.add(cur)
+        # find children
+        for kid, par in parent_map.items():
+            if par == cur:
+                stack.append(kid)
+
+    # Filter descendants from original payload to include only allowed old_ids
+    # We need to map back to original old_id — payload descendants currently have remapped ids.
+    # To correlate, we will rebuild a mapping from old_id -> cloned block in payload by comparing a subset of fields.
+    # Simpler: rebuild a fresh payload by selecting from template_blocks directly.
+
+    # Recreate id_map consistent with original builder
+    id_map: Dict[str, str] = {}
+    for b in template_blocks:
+        oid = str(b.get("block_id") or "")
+        if oid == root_old_id:
+            continue
+        id_map[oid] = secrets.token_hex(12)
+
+    descendants_filtered: List[Dict[str, Any]] = []
+    remove_keys = {
+        "parent_id",
+        "parent_block_id",
+        "document_id",
+        "document_revision_id",
+        "revision_id",
+        "create_time",
+        "update_time",
+        "is_delete",
+    }
+
+    for b in template_blocks:
+        if not isinstance(b, dict) or not b.get("block_id"):
+            continue
+        old_id = str(b["block_id"])
+        if old_id == root_old_id or old_id not in allowed:
+            continue
+        clone = json.loads(json.dumps(b, ensure_ascii=False))
+        clone["block_id"] = id_map.get(old_id, old_id)
+        for k in list(clone.keys()):
+            if k in remove_keys:
+                clone.pop(k, None)
+        # remap children lists
+        for key in ("children", "children_id", "children_ids", "childrenIds"):
+            if isinstance(clone.get(key), list):
+                clone[key] = [id_map.get(str(x), str(x)) for x in clone[key] if x and str(x) in id_map]
+        descendants_filtered.append(clone)
+
+    children_id_filtered = [id_map.get(x, x) for x in first_level_old if x in id_map]
+    payload2 = {"children_id": children_id_filtered, "descendants": descendants_filtered}
+
+    if not payload2.get("descendants"):
+        raise RuntimeError("Template clone retry (first-level) produced no descendants to insert")
+
+    # Second attempt
+    _ = _feishu_insert_blocks_descendant(
+        user_access_token=user_access_token,
+        document_id=target_document_id,
+        parent_block_id=target_parent_block_id,
+        descendant_payload=payload2,
+        index=index,
+        timeout_sec=timeout_sec,
+    )
 
 
 def _feishu_docx_batch_update_blocks(
@@ -1066,8 +1922,14 @@ def _expand_placeholders(value: Any, ctx: Dict[str, Any]) -> Any:
             if end < 0:
                 raise ValueError(f"Unclosed placeholder in: {value!r}")
             key = value[start + 2 : end].strip()
-            resolved = _get_by_dotted_path(ctx, key)
-            out += str(resolved)
+            try:
+                resolved = _get_by_dotted_path(ctx, key)
+            except KeyError:
+                # Some placeholders (e.g. runtime.*) are only available at runtime.
+                # Keep the placeholder as-is so later expansion can still work.
+                out += value[start : end + 1]
+            else:
+                out += str(resolved)
             i = end + 1
         return out
 
@@ -1482,6 +2344,10 @@ def _build_placeholder_replacements_from_dsl(
     nas_share_priority = strategy.get("nas_share_priority") or ["local_dsm_create_share_link", "run_summary_share_links"]
     if not isinstance(nas_share_priority, list):
         nas_share_priority = ["local_dsm_create_share_link", "run_summary_share_links"]
+    # missing_placeholder policy:
+    # - keep (default): keep empty string and continue
+    # - warn: warn and continue
+    # - error: raise when a required placeholder can't be resolved
     missing_policy = str(strategy.get("missing_placeholder") or "keep").strip().lower() or "keep"
 
     vars: Dict[str, Any] = dsl_runtime.get("vars") or {}
@@ -1493,6 +2359,32 @@ def _build_placeholder_replacements_from_dsl(
             return {}
 
     out: Dict[str, str] = {str(k): "" for k in mappings.keys()}
+
+    def _dsl_find_share_link_by_match(*, run_sum: Dict[str, Any], match: Dict[str, Any], what: str) -> str:
+        if not isinstance(match, dict):
+            return ""
+
+        exact = str(match.get("exact") or "").strip()
+        if exact:
+            v = _dsl_find_share_link_for_filename(run_sum, filename=exact)
+            if v:
+                return v
+
+        fb = str(match.get("fallback_regex") or "").strip()
+        if fb:
+            try:
+                return _find_share_link_by_regex(run_sum, filename_regex=re.compile(fb, re.IGNORECASE), what=what)
+            except Exception:
+                pass
+
+        rx = str(match.get("regex") or "").strip()
+        if rx:
+            try:
+                return _find_share_link_by_regex(run_sum, filename_regex=re.compile(rx, re.IGNORECASE), what=what)
+            except Exception:
+                pass
+
+        return ""
 
     for ph, rule in mappings.items():
         phs = str(ph)
@@ -1557,12 +2449,7 @@ def _build_placeholder_replacements_from_dsl(
                     if local_path is not None:
                         val = _dsl_find_share_link_for_filename(run_sum, filename=filename)
                     elif isinstance(rule.get("match"), dict):
-                        m = rule.get("match") or {}
-                        if isinstance(m, dict) and str(m.get("regex") or "").strip():
-                            try:
-                                val = _find_share_link_by_regex(run_sum, filename_regex=re.compile(str(m.get("regex")), re.IGNORECASE), what=phs)
-                            except Exception:
-                                val = ""
+                        val = _dsl_find_share_link_by_match(run_sum=run_sum, match=(rule.get("match") or {}), what=phs)
                     if val:
                         break
                 elif how == "local_dsm_create_share_link":
@@ -1575,7 +2462,10 @@ def _build_placeholder_replacements_from_dsl(
             raise RuntimeError(f"DSL: unsupported placeholder mode={mode!r} for {phs}")
 
         if required and not str(val or "").strip():
-            raise RuntimeError(f"DSL: required placeholder missing: {phs}")
+            if missing_policy == "error":
+                raise RuntimeError(f"DSL: required placeholder missing: {phs}")
+            print(f"WARN: DSL required placeholder missing (skip): {phs}", file=sys.stderr)
+            val = ""
 
         if not str(val or "").strip() and missing_policy == "keep":
             out[phs] = ""
@@ -1768,6 +2658,10 @@ def _build_placeholder_replacements(*, cfg: Dict[str, Any], run_summaries: List[
         "{{REL_DEVICE_NAME}}",
         "{{REL_STAGE}}",
         "{{REL_VERSION}}",
+        "{{REL_APP_TAG}}",
+        "{{REL_BOOT_TAG}}",
+        "{{REL_RECOVERY_TAG}}",
+        "{{REL_FCT_TAG}}",
         "{{REL_BOOTLOADER_MANIFEST_INFO}}",
         "{{REL_RECOVERY_MANIFEST_INFO}}",
         "{{REL_APP_MANIFEST_INFO}}",
@@ -1788,6 +2682,35 @@ def _build_placeholder_replacements(*, cfg: Dict[str, Any], run_summaries: List[
         "{{REL_STAGE}}": stage,
         "{{REL_VERSION}}": version,
     })
+
+    # Jenkins trigger tags (best-effort)
+    def _try_cfg_str(*paths: str) -> str:
+        for p in paths:
+            try:
+                v = _get_by_dotted_path(cfg, p)
+                s = "" if v is None else str(v)
+                if s.strip():
+                    return s.strip()
+            except Exception:
+                continue
+        return ""
+
+    repl["{{REL_APP_TAG}}"] = _try_cfg_str(
+        "jenkins.triggers.release.parameters.TAG_NAME",
+        "triggers.release.TAG_NAME",
+    )
+    repl["{{REL_BOOT_TAG}}"] = _try_cfg_str(
+        "jenkins.triggers.release.parameters.BOOT_TAG_NAME",
+        "triggers.release.BOOT_TAG_NAME",
+    )
+    repl["{{REL_RECOVERY_TAG}}"] = _try_cfg_str(
+        "jenkins.triggers.release.parameters.RECOVERY_TAG_NAME",
+        "triggers.release.RECOVERY_TAG_NAME",
+    )
+    repl["{{REL_FCT_TAG}}"] = _try_cfg_str(
+        "jenkins.triggers.release.parameters.FCT_TAG_NAME",
+        "triggers.release.FCT_TAG_NAME",
+    )
 
     # Links / URLs
     try:
@@ -2385,6 +3308,7 @@ def _run_uploader(
     remote_base_dir: str,
     folder_name: str,
     local_dir: str,
+    skip_existing: bool,
     dry_run: bool,
     show_progress: bool,
 ) -> None:
@@ -2397,6 +3321,7 @@ def _run_uploader(
         "local_dir": local_dir,
         "verify_tls": verify_tls,
         "timeout_sec": timeout_sec,
+        "skip_existing": bool(skip_existing),
     }
 
     with tempfile.NamedTemporaryFile(
@@ -2416,6 +3341,8 @@ def _run_uploader(
             cmd.append("--dry-run")
         if show_progress:
             cmd.append("--progress")
+        if skip_existing:
+            cmd.append("--skip-existing")
         print(
             "NAS: upload via nas_webdav_upload.py "
             f"(user={nas_username}, pass={_mask(nas_password)}, local={local_dir})"
@@ -2428,6 +3355,70 @@ def _run_uploader(
             os.unlink(tmp_path)
         except OSError:
             pass
+
+
+def _stage_unique_extra_upload_dir(
+    *,
+    extra_dir: Path,
+    seen_relpaths: Dict[str, int],
+) -> Tuple[str, int, int]:
+    """Create a temp dir containing only files whose relpath wasn't seen.
+
+    - seen_relpaths maps rel_posix -> size_bytes of the first occurrence.
+    - If a duplicate relpath has a different size, raise (real conflict).
+    - Uses hardlink when possible to avoid copying large files.
+
+    Returns (staged_dir, kept_count, skipped_count). staged_dir is '' if empty.
+    """
+
+    extra_dir = Path(extra_dir).expanduser().resolve()
+    if not extra_dir.exists() or not extra_dir.is_dir():
+        return "", 0, 0
+
+    tmp_root = Path(tempfile.mkdtemp(prefix="nas_extra_unique_"))
+    kept = 0
+    skipped = 0
+
+    try:
+        for src, rel in _iter_local_files(extra_dir):
+            try:
+                size = int(src.stat().st_size)
+            except Exception:
+                # If we can't stat, treat as unique and try uploading.
+                size = -1
+
+            if rel in seen_relpaths:
+                if size >= 0 and seen_relpaths.get(rel, size) != size:
+                    raise RuntimeError(
+                        "NAS: duplicate remote path with different content size: "
+                        f"{rel} (prev_size={seen_relpaths.get(rel)}, new_size={size}, src={src})"
+                    )
+                skipped += 1
+                continue
+
+            seen_relpaths[rel] = size
+            dst = tmp_root / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(src, dst)
+            except Exception:
+                shutil.copy2(src, dst)
+            kept += 1
+
+        if kept == 0:
+            try:
+                shutil.rmtree(tmp_root)
+            except Exception:
+                pass
+            return "", 0, skipped
+
+        return str(tmp_root), kept, skipped
+    except Exception:
+        try:
+            shutil.rmtree(tmp_root)
+        except Exception:
+            pass
+        raise
 
 
 def _derive_dsm_base_url_from_webdav(webdav_base_url: str) -> str:
@@ -2507,6 +3498,21 @@ def main() -> int:
     ap.add_argument("--skip-doc", action="store_true", help="Skip generating local Feishu version doc")
     ap.add_argument("--skip-feishu", action="store_true", help="Skip generating Feishu cloud doc")
     ap.add_argument(
+        "--feishu-preauth",
+        action="store_true",
+        help="Run Feishu OAuth upfront (before long-running steps) to avoid interactive authorization later.",
+    )
+    ap.add_argument(
+        "--feishu-preauth-only",
+        action="store_true",
+        help="Only run Feishu OAuth pre-auth and exit (useful before starting background Jenkins/pipeline runs).",
+    )
+    ap.add_argument(
+        "--feishu-preauth-force",
+        action="store_true",
+        help="Force OAuth even if feishu.user_access_token already exists in config.",
+    )
+    ap.add_argument(
         "--doc-output",
         default="",
         help="Directory to write the local version doc (default: user home/release_docs)",
@@ -2546,10 +3552,55 @@ def main() -> int:
     feishu_docx_replace_placeholders = bool(feishu_cfg.get("docx_replace_placeholders", False))
     feishu_docx_replace_only = bool(feishu_cfg.get("docx_replace_only", False))
 
+    # Final notification summary (sent via notifications.webhook).
+    feishu_final_url: str = ""
+    feishu_status: str = ""
+    local_doc_status: str = ""
+
     feishu_oauth_cfg = (feishu_cfg.get("oauth") or {}) if isinstance(feishu_cfg.get("oauth"), dict) else {}
     feishu_oauth_enabled = bool(feishu_oauth_cfg.get("enabled", False))
     feishu_oauth_auto_save = bool(feishu_oauth_cfg.get("auto_save_user_access_token", False))
     feishu_oauth_auto_on_expired = bool(feishu_oauth_cfg.get("auto_oauth_on_99991677", True))
+
+    # Optional: pre-authorize Feishu OAuth now so background runs won't pause for interactive auth.
+    if args.feishu_preauth or args.feishu_preauth_only:
+        # If Feishu is disabled, preauth is a no-op.
+        if not feishu_enabled:
+            print("Feishu pre-auth: feishu.enabled=false; nothing to do")
+            if args.feishu_preauth_only:
+                return 0
+        else:
+            have_token = bool(_feishu_user_token_from_cfg(feishu_cfg))
+            if have_token and (not args.feishu_preauth_force):
+                print("Feishu pre-auth: user_access_token already present; skip (use --feishu-preauth-force to re-authorize)")
+                if args.feishu_preauth_only:
+                    return 0
+            else:
+                if not feishu_oauth_enabled:
+                    if have_token:
+                        print("Feishu pre-auth: OAuth disabled but user_access_token is present; proceeding")
+                        if args.feishu_preauth_only:
+                            return 0
+                    raise SystemExit(
+                        "Feishu pre-auth requested but feishu.oauth.enabled=false and no user_access_token is present. "
+                        "Enable feishu.oauth.* or set feishu.user_access_token in config."
+                    )
+
+                print("Feishu pre-auth: starting OAuth now...")
+                new_token = _feishu_oauth_get_user_access_token_localhost(oauth_cfg=feishu_oauth_cfg, timeout_sec=feishu_timeout_sec)
+                feishu_cfg["user_access_token"] = new_token
+
+                # In preauth-only mode, default to saving the token so later background runs won't block.
+                should_save = bool(feishu_oauth_auto_save) or bool(args.feishu_preauth_only)
+                _feishu_maybe_save_user_access_token(cfg_path=cfg_path, cfg_raw=cfg_raw, access_token=new_token, enabled=should_save)
+
+                if should_save:
+                    print("Feishu pre-auth: token saved into config")
+                else:
+                    print("WARN: Feishu pre-auth: token obtained but NOT saved (set feishu.oauth.auto_save_user_access_token=true)", file=sys.stderr)
+
+                if args.feishu_preauth_only:
+                    return 0
 
     prepare_cfg = cfg.get("prepare", {}) or {}
     prepare_mode = str(prepare_cfg.get("mode", "none")).strip()
@@ -2658,6 +3709,40 @@ def main() -> int:
 
     builds = cfg["jenkins"]["builds"]
     run_summaries: List[Dict[str, Any]] = []
+
+    def _finalize(exit_code: int) -> int:
+        # Build a concise final message.
+        release_cfg_final = cfg.get("release") or {}
+        proj = str(release_cfg_final.get("project") or "").strip()
+        ver = str(release_cfg_final.get("version") or "").strip()
+        stage = str(release_cfg_final.get("stage") or "").strip()
+
+        parts: List[str] = []
+        header = "Release pipeline complete"
+        if proj or ver:
+            header += f": {proj} {ver}".rstrip()
+        if stage:
+            header += f" ({stage})"
+        parts.append(header)
+
+        if local_doc_status:
+            parts.append(f"Local doc: {local_doc_status}")
+        if feishu_status:
+            parts.append(f"Feishu doc: {feishu_status}")
+        elif feishu_final_url:
+            parts.append(f"Feishu doc: {feishu_final_url}")
+        else:
+            # If Feishu was disabled or skipped, make that explicit.
+            if not feishu_enabled:
+                parts.append("Feishu doc: disabled")
+            elif args.skip_feishu:
+                parts.append("Feishu doc: skipped (--skip-feishu)")
+            elif args.dry_run:
+                parts.append("Feishu doc: skipped (dry-run)")
+
+        _maybe_notify_webhook_text(cfg=cfg, text="\n".join(parts), request_timeout_sec=10)
+        print("\nPipeline complete.")
+        return int(exit_code)
 
     # Map upload specs by name for convenience
     uploads_by_name: Dict[str, Dict[str, Any]] = {}
@@ -2819,29 +3904,74 @@ def main() -> int:
             remote_base_dir=remote_variant_base,
             folder_name=remote_subdir,
             local_dir=local_dir,
+            skip_existing=False,
             dry_run=args.dry_run,
             show_progress=show_progress,
         )
 
-        # Upload extra dirs (e.g., extracted files) into the same remote subdir
+        # Upload extra dirs (e.g., extracted files) into the same remote subdir.
+        # Root-cause fix: ensure we NEVER upload the same remote-relative path twice.
+        seen_relpaths: Dict[str, int] = {}
+        try:
+            for _, rel in _iter_local_files(Path(local_dir).expanduser().resolve()):
+                # size is filled in below; here keep placeholder to avoid re-stat cost.
+                seen_relpaths.setdefault(rel, -1)
+        except Exception:
+            pass
+
         for extra in extra_local_dirs:
-            extra_path = str(extra)
-            if not extra_path.strip():
+            extra_path_raw = str(extra)
+            if not extra_path_raw.strip():
                 continue
+
+            extra_path = Path(extra_path_raw).expanduser().resolve()
             print(f"NAS: extra upload from: {extra_path}")
-            _run_uploader(
-                uploader_script=uploader_script,
-                nas_base_url=nas_base_url,
-                nas_username=nas_user,
-                nas_password=nas_pass,
-                verify_tls=nas_verify_tls,
-                timeout_sec=nas_timeout_sec,
-                remote_base_dir=remote_variant_base,
-                folder_name=remote_subdir,
-                local_dir=extra_path,
-                dry_run=args.dry_run,
-                show_progress=show_progress,
+
+            staged_dir, kept, skipped = _stage_unique_extra_upload_dir(
+                extra_dir=extra_path,
+                seen_relpaths=seen_relpaths,
             )
+            if not staged_dir:
+                print(f"NAS: extra upload skipped (all duplicates): {extra_path} (skipped={skipped})")
+                continue
+
+            print(f"NAS: extra upload unique files: kept={kept}, skipped_duplicates={skipped}")
+            try:
+                _run_uploader(
+                    uploader_script=uploader_script,
+                    nas_base_url=nas_base_url,
+                    nas_username=nas_user,
+                    nas_password=nas_pass,
+                    verify_tls=nas_verify_tls,
+                    timeout_sec=nas_timeout_sec,
+                    remote_base_dir=remote_variant_base,
+                    folder_name=remote_subdir,
+                    local_dir=staged_dir,
+                    # For extra uploads, keep reruns resilient.
+                    skip_existing=True,
+                    dry_run=args.dry_run,
+                    show_progress=show_progress,
+                )
+            finally:
+                try:
+                    shutil.rmtree(staged_dir)
+                except Exception:
+                    pass
+
+        # Track root-level filenames that have already been uploaded into remote_subdir root.
+        # Special uploads (below) upload files into remote_subdir root by filename, so if a file
+        # already exists at the root of local_dir or any extra_local_dirs, re-uploading is redundant.
+        already_uploaded_root_names: set[str] = set()
+        for root_dir in [local_dir] + [str(x) for x in extra_local_dirs]:
+            try:
+                rp = Path(str(root_dir)).expanduser().resolve()
+                if not rp.exists() or not rp.is_dir():
+                    continue
+                for p in rp.iterdir():
+                    if p.is_file():
+                        already_uploaded_root_names.add(p.name)
+            except Exception:
+                continue
 
         # Special-case: for release builds, also upload archive files matching patterns
         # Use patterns so different version timestamps are handled automatically.
@@ -2867,8 +3997,9 @@ def main() -> int:
             ]
         special_share_links: Dict[str, Dict[str, str]] = {}
         if name == "release":
-            # search in primary local_dir and any extra dirs, prepared_dir, and internal work folder (step1_archive_<project>)
-            search_paths: List[Path] = [Path(local_dir)] + [Path(x) for x in extra_local_dirs]
+            # Search in extra/prepared/internal work folders only.
+            # NOTE: primary local_dir is already uploaded above; including it here causes duplicate uploads.
+            search_paths: List[Path] = [Path(x) for x in extra_local_dirs]
             if prepared_dir:
                 search_paths.append(prepared_dir)
             # include workspace internal _work/step1_archive_<project> if prepare used workspace_dir
@@ -2898,6 +4029,28 @@ def main() -> int:
                             found_files.append(p)
                             break
 
+            # De-duplicate by filename (these files are uploaded into remote_subdir root).
+            unique_by_name: Dict[str, Path] = {}
+            for p in found_files:
+                try:
+                    key = str(p.name)
+                except Exception:
+                    continue
+                if not key:
+                    continue
+                unique_by_name.setdefault(key, p)
+            found_files = [unique_by_name[k] for k in sorted(unique_by_name.keys())]
+
+            # Skip special uploads for files that were already uploaded via main/extra dirs.
+            if already_uploaded_root_names:
+                skipped = [p for p in found_files if p.name in already_uploaded_root_names]
+                if skipped:
+                    print(
+                        f"NAS: special upload skipped {len(skipped)} already-uploaded file(s): "
+                        + ", ".join(sorted({p.name for p in skipped}))
+                    )
+                found_files = [p for p in found_files if p.name not in already_uploaded_root_names]
+
             # Upload each found file by copying it into a temp dir and calling uploader
             for fpath in found_files:
                 print(f"NAS: special upload file found: {fpath}")
@@ -2915,6 +4068,9 @@ def main() -> int:
                         remote_base_dir=remote_variant_base,
                         folder_name=remote_subdir,
                         local_dir=str(tmpdir),
+                        # Special uploads are prone to duplicates (already uploaded by main/extra dirs).
+                        # If the server rejects overwrite/conflict, skip and continue.
+                        skip_existing=True,
                         dry_run=args.dry_run,
                         show_progress=show_progress,
                     )
@@ -3033,6 +4189,14 @@ def main() -> int:
         )
         doc_path.write_text(md, encoding="utf-8")
         print(f"\nVersion doc generated: {doc_path}")
+        local_doc_status = str(doc_path)
+    else:
+        if args.skip_doc:
+            local_doc_status = "skipped (--skip-doc)"
+        elif not doc_enabled:
+            local_doc_status = "disabled"
+        else:
+            local_doc_status = "skipped"
 
     # Generate Feishu cloud doc (copy template -> insert converted blocks)
     if feishu_enabled and (not args.skip_feishu):
@@ -3051,6 +4215,8 @@ def main() -> int:
                 )
 
         user_token = _feishu_user_token_from_cfg(feishu_cfg)
+        access_token = user_token
+        token_kind = "user"
         name_tmpl = str(feishu_cfg.get("name_template") or "{project}_{version}_{timestamp}_版本文档").strip()
 
         release_cfg = cfg.get("release") or {}
@@ -3081,13 +4247,29 @@ def main() -> int:
             _feishu_maybe_save_user_access_token(cfg_path=cfg_path, cfg_raw=cfg_raw, access_token=new_token, enabled=feishu_oauth_auto_save)
             return new_token
 
-        if not user_token and not args.dry_run:
+        # For Docx flow (use_wiki=false), default to user token for maximum compatibility.
+        # Tenant/app token can be enabled explicitly via feishu.prefer_tenant_access_token.
+        prefer_tenant_token = bool(feishu_cfg.get("prefer_tenant_access_token", False))
+        if (not feishu_use_wiki) and prefer_tenant_token and (not args.dry_run):
+            try:
+                access_token = _feishu_get_tenant_access_token_cached(cfg_path=cfg_path, feishu_cfg=feishu_cfg, timeout_sec=feishu_timeout_sec)
+                token_kind = "tenant"
+            except Exception as e:
+                print(f"WARN: failed to get tenant_access_token; falling back to user token/OAuth: {e}", file=sys.stderr)
+                access_token = user_token
+                token_kind = "user"
+
+        if (not access_token) and (not args.dry_run):
+            # Only attempt OAuth when we are on user-token path.
             if feishu_oauth_enabled:
                 user_token = _feishu_oauth_refresh_token("user_access_token missing")
+                access_token = user_token
+                token_kind = "user"
             else:
                 raise SystemExit(
-                    "Feishu enabled but user access token missing. "
-                    "Set feishu.user_access_token (JSON) or enable feishu.oauth.* to auto-run OAuth."
+                    "Feishu enabled but no usable access token. "
+                    "Set feishu.user_access_token (or enable feishu.oauth.*), "
+                    "or explicitly enable feishu.prefer_tenant_access_token with app credentials."
                 )
 
         if feishu_use_wiki:
@@ -3105,6 +4287,7 @@ def main() -> int:
                 print(f"  target_space_id={target_space_id}")
                 print(f"  target_parent_token={target_parent_token}")
                 print(f"  title={doc_name}")
+                feishu_status = "skipped (dry-run)"
             else:
                 if not template_node_token:
                     raise SystemExit("Feishu Wiki enabled but template_node_token/template_page_id missing in config.")
@@ -3187,6 +4370,47 @@ def main() -> int:
                 new_obj_type = str(new_node.get("obj_type") or "").strip().lower()
                 new_obj_token = str(new_node.get("obj_token") or "").strip()
                 new_url = str(new_node.get("url") or "").strip() or (f"https://zepp.feishu.cn/wiki/{new_node_token}" if new_node_token else "")
+                feishu_final_url = new_url
+
+                # Default doc admin collaborator (Wiki flow too).
+                if "admin_email" in feishu_cfg:
+                    admin_email = str(feishu_cfg.get("admin_email") or "").strip()
+                else:
+                    admin_email = "hanzhijian@zepp.com"
+                share_perm = str(feishu_cfg.get("share_admin_perm") or "full_access").strip() or "full_access"
+                share_file_type = str(feishu_cfg.get("share_file_type") or "docx").strip() or "docx"
+
+                if admin_email and new_obj_token:
+                    try:
+                        member_type = "email"
+                        member_id = admin_email
+                        try:
+                            open_id = _feishu_contact_get_open_id_by_email(
+                                user_access_token=user_token,
+                                email=admin_email,
+                                timeout_sec=feishu_timeout_sec,
+                            )
+                            if open_id:
+                                member_type = "openid"
+                                member_id = open_id
+                        except Exception:
+                            pass
+
+                        resp = _feishu_drive_add_permission_member_best_effort(
+                            user_access_token=user_token,
+                            file_token=new_obj_token,
+                            preferred_file_type=share_file_type,
+                            member_type=member_type,
+                            member_id=member_id,
+                            perm=share_perm,
+                            timeout_sec=feishu_timeout_sec,
+                        )
+                        if int(resp.get("code") or 0) != 0:
+                            print(f"WARN: Feishu Wiki share admin returned error: {resp}", file=sys.stderr)
+                        else:
+                            print(f"Feishu Wiki Docx: granted {share_perm} to {admin_email}")
+                    except Exception as e:
+                        print(f"WARN: Feishu Wiki share admin failed: {e}", file=sys.stderr)
 
                 # Best-effort: write placeholder mapping as soon as we have run_summaries.
                 # This enables manual replacement (especially NAS share links) even when
@@ -3207,14 +4431,23 @@ def main() -> int:
                     except Exception as e:
                         print(f"WARN: failed to write placeholder mapping: {e}", file=sys.stderr)
 
-                # Copy-only mode: stop here (no docx operations). Optionally output placeholder mapping.
-                if feishu_wiki_copy_only:
-                    print(f"Feishu Wiki generated: {new_url}")
-                    return 0
-
                 if not new_obj_token:
+                    if feishu_wiki_copy_only:
+                        print("WARN: Feishu Wiki copy-only: missing obj_token; skip placeholder replace", file=sys.stderr)
+                        print(f"Feishu Wiki generated: {new_url}")
+                        feishu_status = new_url or "generated"
+                        return _finalize(0)
                     raise RuntimeError(f"Feishu Wiki: copied node missing obj_token: {new_node}")
+
                 if new_obj_type != "docx":
+                    if feishu_wiki_copy_only:
+                        print(
+                            f"WARN: Feishu Wiki copy-only: obj_type={new_obj_type!r} not docx; skip placeholder replace",
+                            file=sys.stderr,
+                        )
+                        print(f"Feishu Wiki generated: {new_url}")
+                        feishu_status = new_url or "generated"
+                        return _finalize(0)
                     raise RuntimeError(
                         f"Feishu Wiki: copied node obj_type={new_obj_type!r} not supported yet (need docx). "
                         "Tip: make your wiki template point to a docx document."
@@ -3262,12 +4495,23 @@ def main() -> int:
                         else:
                             raise
 
+                # Copy-only mode: stop here (skip markdown insertion), after optional placeholder replacement.
+                if feishu_wiki_copy_only:
+                    print(f"Feishu Wiki generated: {new_url}")
+                    feishu_status = new_url or "generated"
+                    return _finalize(0)
+
                 if feishu_docx_replace_only:
                     print(f"Feishu Wiki generated: {new_url}")
-                    return 0
+                    feishu_status = new_url or "generated"
+                    return _finalize(0)
 
                 # Insert markdown into the underlying docx of the new wiki node.
-                parent_id = feishu_parent_block_id or new_obj_token
+                parent_id = feishu_parent_block_id or _feishu_docx_find_root_page_block_id_best_effort(
+                    user_access_token=user_token,
+                    document_id=new_obj_token,
+                    timeout_sec=feishu_timeout_sec,
+                )
                 try:
                     def _do_insert() -> None:
                         print("Feishu Wiki: converting markdown to blocks...")
@@ -3321,7 +4565,8 @@ def main() -> int:
 
                             _do_insert_retry()
                             print(f"Feishu Wiki generated: {new_url}")
-                            return 0
+                            feishu_status = new_url or "generated"
+                            return _finalize(0)
                         except RuntimeError:
                             raise
                     if "99991679" in msg and ("docx" in msg.lower() or "document" in msg.lower()):
@@ -3331,37 +4576,261 @@ def main() -> int:
                             file=sys.stderr,
                         )
                         print(f"Feishu Wiki generated: {new_url}")
-                        return 0
+                        feishu_status = new_url or "generated"
+                        return _finalize(0)
                     raise
 
         else:
-            template_token = str(feishu_cfg.get("template_file_token") or "").strip()
-            folder_token = str(feishu_cfg.get("target_folder_token") or "").strip()
-            if args.dry_run:
-                print("\nFeishu Docx: dry-run; would copy template + insert markdown blocks")
-                print(f"  template_file_token={template_token}")
-                print(f"  target_folder_token={folder_token}")
-                print(f"  name={doc_name}")
+            template_token_raw = str(feishu_cfg.get("template_file_token") or "").strip()
+            template_token = _feishu_extract_docx_token(value=template_token_raw)
+            # Destination folder for copy. Some tenants require it.
+            docx_target_folder_token_raw = str(
+                feishu_cfg.get("docx_target_folder_token")
+                or feishu_cfg.get("target_folder_token")
+                or feishu_cfg.get("folder_token")
+                or ""
+            ).strip()
+            docx_target_folder_token = _feishu_extract_drive_folder_token(value=docx_target_folder_token_raw)
+            docx_allow_create_fallback = bool(feishu_cfg.get("docx_allow_create_fallback", True))
+            docx_domain = str(feishu_cfg.get("docx_domain") or "").strip()
+            if (not docx_domain) and (template_token_raw.startswith("http://") or template_token_raw.startswith("https://")):
+                try:
+                    docx_domain = urllib.parse.urlsplit(template_token_raw).netloc.strip()
+                except Exception:
+                    docx_domain = ""
+            if not docx_domain:
+                # Tenant-specific default (requested).
+                docx_domain = "zepp.feishu.cn"
+            # Default doc admin collaborator.
+            # If user explicitly provides admin_email (even empty), respect it.
+            if "admin_email" in feishu_cfg:
+                admin_email = str(feishu_cfg.get("admin_email") or "").strip()
             else:
-                if not template_token or not folder_token:
-                    raise SystemExit("Feishu enabled but template_file_token/target_folder_token missing in config.")
+                admin_email = "hanzhijian@zepp.com"
+            share_perm = str(feishu_cfg.get("share_admin_perm") or "full_access").strip() or "full_access"
+            share_file_type = str(feishu_cfg.get("share_file_type") or "docx").strip() or "docx"
+            if args.dry_run:
+                if feishu_docx_replace_only:
+                    print("\nFeishu Docx: dry-run; would copy template + replace placeholders (replace-only)")
+                else:
+                    print("\nFeishu Docx: dry-run; would copy template + insert markdown blocks")
+                print(f"  template_file_token={template_token_raw}")
+                print(f"  template_token={template_token}")
+                print(f"  docx_target_folder_token={docx_target_folder_token_raw}")
+                print(f"  docx_allow_create_fallback={docx_allow_create_fallback}")
+                print(f"  name={doc_name}")
+                print(f"  token_kind={token_kind}")
+            else:
+                if not template_token:
+                    raise SystemExit("Feishu enabled but template_file_token missing or invalid (expect docx token or URL).")
 
-                print("\nFeishu Docx: copying template...")
-                new_doc_id, new_doc_url = _feishu_copy_template_docx(
-                    user_access_token=user_token,
-                    template_file_token=template_token,
-                    target_folder_token=folder_token,
+                new_doc_id = ""
+                new_doc_url = ""
+                need_clone_template_content = False
+
+                # Per requirement: do not use/require folder tokens. Always create/copy into app space.
+                print("\nFeishu Docx: copying template (docx API)...")
+                copied = _feishu_docx_copy_template_best_effort(
+                    user_access_token=access_token,
+                    template_document_id=template_token,
                     name=doc_name,
+                    target_folder_token=docx_target_folder_token,
                     timeout_sec=feishu_timeout_sec,
                 )
+                if copied:
+                    new_doc_id, new_doc_url = copied
+                    print(f"Feishu Docx: template copied (docx API) -> {new_doc_id}")
+
+                if not new_doc_id:
+                    print("\nFeishu Docx: copying template (drive API)...")
+                    try:
+                        new_doc_id, new_doc_url = _feishu_copy_template_docx(
+                            user_access_token=access_token,
+                            template_file_token=template_token,
+                            target_folder_token=docx_target_folder_token,
+                            name=doc_name,
+                            timeout_sec=feishu_timeout_sec,
+                        )
+                    except Exception as e:
+                            msg = str(e)
+                            # Missing user-granted privileges; re-run OAuth (if enabled) and retry once.
+                            if (
+                                ("99991679" in msg or "Unauthorized" in msg)
+                                and feishu_oauth_enabled
+                                and (not args.dry_run)
+                            ):
+                                print("Feishu Drive copy permission denied (99991679); re-running OAuth to refresh scopes...")
+                                user_token = _feishu_oauth_refresh_token("permission denied (99991679) for Drive copy")
+                                access_token = user_token
+                                token_kind = "user"
+                                try:
+                                    new_doc_id, new_doc_url = _feishu_copy_template_docx(
+                                        user_access_token=access_token,
+                                        template_file_token=template_token,
+                                        target_folder_token=docx_target_folder_token,
+                                        name=doc_name,
+                                        timeout_sec=feishu_timeout_sec,
+                                    )
+                                    # Success after re-auth.
+                                    msg = ""
+                                except Exception as e2:
+                                    msg = str(e2)
+                                    e = e2
+                            if not msg:
+                                pass
+                            # If the tenant requires folder_token but none configured,
+                            # allow fallback to create+clone when explicitly permitted by config.
+                            if ("folder_token is required" in msg or "99992402" in msg) and (not docx_target_folder_token):
+                                if not docx_allow_create_fallback:
+                                    raise SystemExit(
+                                        "Feishu Drive copy requires a destination folder_token in this tenant, but none is configured. "
+                                        "Please set feishu.docx_target_folder_token to a Drive folder token (or a folder URL like https://zepp.feishu.cn/drive/folder/<token>), "
+                                        "then rerun."
+                                    )
+                                # fallback allowed: create new doc and clone content
+                                print(
+                                    "WARN: Feishu Drive copy requires folder_token in this tenant. "
+                                    "Falling back to creating a new docx in app space and cloning template content (docx_allow_create_fallback=true).",
+                                    file=sys.stderr,
+                                )
+                                new_doc_id, new_doc_url = _feishu_create_docx_best_effort(
+                                    user_access_token=access_token,
+                                    title=doc_name,
+                                    folder_token="",
+                                    timeout_sec=feishu_timeout_sec,
+                                )
+                                need_clone_template_content = True
+                            else:
+                                # Other errors propagate
+                                if (not docx_allow_create_fallback):
+                                    raise SystemExit(
+                                        "Feishu template copy failed and docx_allow_create_fallback=false, so the pipeline will not create a new blank document. "
+                                        f"Last error: {e}"
+                                    )
+                                # If fallback allowed but this is another error, try fallback as last resort
+                                print(
+                                    f"WARN: Feishu Drive copy failed ({e}); attempting create+clone fallback (docx_allow_create_fallback=true).",
+                                    file=sys.stderr,
+                                )
+                                new_doc_id, new_doc_url = _feishu_create_docx_best_effort(
+                                    user_access_token=access_token,
+                                    title=doc_name,
+                                    folder_token="",
+                                    timeout_sec=feishu_timeout_sec,
+                                )
+                                need_clone_template_content = True
+
+                if not new_doc_id:
+                    raise SystemExit(
+                        "Feishu template copy did not produce a new document token. "
+                        "Please check that the app/user token has access to the template doc and that the destination folder (if required) is configured."
+                    )
+
                 if not new_doc_url:
-                    new_doc_url = f"https://docs.feishu.cn/docx/{new_doc_id}"
+                    if docx_domain:
+                        new_doc_url = f"https://{docx_domain}/docx/{new_doc_id}"
+                    else:
+                        # Avoid hard-coding a possibly-wrong domain; ask Drive meta for the final URL.
+                        new_doc_url = _feishu_drive_resolve_url_best_effort(
+                            user_access_token=access_token,
+                            token=new_doc_id,
+                            timeout_sec=feishu_timeout_sec,
+                        )
+                        if not new_doc_url:
+                            new_doc_url = f"https://zepp.feishu.cn/docx/{new_doc_id}"
                 print(f"Feishu Docx: template copied -> {new_doc_id}")
 
-                parent_id = feishu_parent_block_id or new_doc_id
+                # If we had to create a new doc (or the copy produced an empty doc),
+                # clone the template blocks into it so the document is not blank.
+                try:
+                    if not need_clone_template_content:
+                        has_content = _feishu_docx_document_has_any_content(
+                            user_access_token=access_token,
+                            document_id=new_doc_id,
+                            timeout_sec=feishu_timeout_sec,
+                        )
+                        if not has_content:
+                            need_clone_template_content = True
+                            print(
+                                "WARN: Feishu Docx appears empty after copy; will clone template content via blocks.",
+                                file=sys.stderr,
+                            )
+
+                    if need_clone_template_content:
+                        parent_id_for_clone = feishu_parent_block_id or _feishu_docx_find_root_page_block_id_best_effort(
+                            user_access_token=access_token,
+                            document_id=new_doc_id,
+                            timeout_sec=feishu_timeout_sec,
+                        )
+                        print("Feishu Docx: cloning template content via blocks...")
+                        _feishu_docx_clone_template_content_into_document_best_effort(
+                            user_access_token=access_token,
+                            template_document_id=template_token,
+                            target_document_id=new_doc_id,
+                            target_parent_block_id=parent_id_for_clone,
+                            index=0,
+                            timeout_sec=feishu_timeout_sec,
+                        )
+                except Exception as e:
+                    print(f"WARN: Feishu Docx clone template content failed: {e}", file=sys.stderr)
+
+                if admin_email:
+                    try:
+                        member_type = "email"
+                        member_id = admin_email
+                        try:
+                            open_id = _feishu_contact_get_open_id_by_email(
+                                user_access_token=access_token,
+                                email=admin_email,
+                                timeout_sec=feishu_timeout_sec,
+                            )
+                            if open_id:
+                                member_type = "openid"
+                                member_id = open_id
+                        except Exception:
+                            pass
+
+                        resp = _feishu_drive_add_permission_member_best_effort(
+                            user_access_token=access_token,
+                            file_token=new_doc_id,
+                            preferred_file_type=share_file_type,
+                            member_type=member_type,
+                            member_id=member_id,
+                            perm=share_perm,
+                            timeout_sec=feishu_timeout_sec,
+                        )
+                        if int(resp.get("code") or 0) != 0:
+                            print(f"WARN: Feishu share admin returned error: {resp}", file=sys.stderr)
+                        else:
+                            print(f"Feishu Docx: granted {share_perm} to {admin_email}")
+                    except Exception as e:
+                        print(f"WARN: Feishu share admin failed: {e}", file=sys.stderr)
+
+                if feishu_docx_replace_placeholders:
+                    mapping_now = _build_placeholder_replacements(cfg=cfg, run_summaries=run_summaries)
+                    print("Feishu Docx: replacing placeholders in template...")
+                    _ = _feishu_docx_replace_placeholders_in_document(
+                        user_access_token=access_token,
+                        document_id=new_doc_id,
+                        mapping=mapping_now,
+                        timeout_sec=feishu_timeout_sec,
+                        dry_run=args.dry_run,
+                    )
+
+                if feishu_docx_replace_only:
+                    print(f"Feishu doc generated: {new_doc_url}")
+                    feishu_final_url = str(new_doc_url or "").strip()
+                    feishu_status = feishu_final_url or "generated"
+                    return _finalize(0)
+
+                parent_id = feishu_parent_block_id or _feishu_docx_find_root_page_block_id_best_effort(
+                    user_access_token=access_token,
+                    document_id=new_doc_id,
+                    timeout_sec=feishu_timeout_sec,
+                )
                 print("Feishu Docx: converting markdown to blocks...")
                 convert_resp = _feishu_convert_markdown_to_blocks(
-                    user_access_token=user_token,
+                    user_access_token=access_token,
                     markdown=md,
                     timeout_sec=feishu_timeout_sec,
                 )
@@ -3373,7 +4842,7 @@ def main() -> int:
                 descendant_payload = _feishu_extract_descendant_payload(convert_resp)
                 print("Feishu Docx: inserting blocks into docx...")
                 _ = _feishu_insert_blocks_descendant(
-                    user_access_token=user_token,
+                    user_access_token=access_token,
                     document_id=new_doc_id,
                     parent_block_id=parent_id,
                     descendant_payload=descendant_payload,
@@ -3381,9 +4850,18 @@ def main() -> int:
                     timeout_sec=feishu_timeout_sec,
                 )
                 print(f"Feishu doc generated: {new_doc_url}")
+                feishu_final_url = str(new_doc_url or "").strip()
+                feishu_status = feishu_final_url or "generated"
 
-    print("\nPipeline complete.")
-    return 0
+    else:
+        if not feishu_enabled:
+            feishu_status = "disabled"
+        elif args.skip_feishu:
+            feishu_status = "skipped (--skip-feishu)"
+        elif args.dry_run:
+            feishu_status = "skipped (dry-run)"
+
+    return _finalize(0)
 
 
 if __name__ == "__main__":

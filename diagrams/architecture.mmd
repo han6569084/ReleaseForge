@@ -1,0 +1,57 @@
+graph LR
+  subgraph Dev["开发者/发布工程师"]
+    PS["PowerShell / CMD"]
+  end
+
+  subgraph Orchestrator["编排层"]
+    JT["jenkins_trigger_build.py"]
+    RP["release_pipeline_run.py"]
+  end
+
+  subgraph Jenkins["Jenkins"]
+    JJOB["Job: firmware_auto_trigger/... "]
+    JAPI["Jenkins HTTP API"]
+  end
+
+  subgraph NAS["NAS (Synology)"]
+    WD["WebDAV"]
+    DSM["DSM FileStation API"]
+  end
+
+  subgraph Feishu["Feishu"]
+    OAuth["OAuth / user_access_token"]
+    Wiki["Wiki v2"]
+    Docx["Docx v1"]
+    Flow["Flow Webhook"]
+  end
+
+  PS --> JT --> JAPI --> JJOB
+  JT --> RP
+
+  RP --> JAPI
+  RP --> WD
+  RP --> DSM
+
+  RP --> OAuth
+  RP --> Wiki --> Docx
+  RP --> Flow
+
+  RP --> Out["本地输出: output/ work/ upload/"]
+
+  JT_NOTE["触发/等待 Jenkins; 写回 build_url; 可自动启动主流程"]
+  RP_NOTE["下载/准备/上传/共享/文档/飞书"]
+  JAPI_NOTE["crumb / queue / build / artifacts / consoleText"]
+  WD_NOTE["上传目录与文件"]
+  DSM_NOTE["生成共享链接"]
+  Wiki_NOTE["复制模板 node"]
+  Docx_NOTE["列块/替换/插入"]
+  Flow_NOTE["通知"]
+
+  JT -.-> JT_NOTE
+  RP -.-> RP_NOTE
+  JAPI -.-> JAPI_NOTE
+  WD -.-> WD_NOTE
+  DSM -.-> DSM_NOTE
+  Wiki -.-> Wiki_NOTE
+  Docx -.-> Docx_NOTE
+  Flow -.-> Flow_NOTE
